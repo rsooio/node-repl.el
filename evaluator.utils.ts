@@ -11,12 +11,20 @@ const noop = () => {};
 const visitorsWithoutAncestors: RecursiveVisitors<any> = {
   ClassDeclaration(node, state, c) {
     if (isTopLevelDeclaration(state)) {
-      state.prepend(node, `${node.id!.name}=`);
+      // 改写为 __replPatchClass 调用：外层赋值接收 patch 结果（旧类），
+      // 参数 1 是旧绑定，参数 2 是新类（先临时赋值到绑定，副作用可接受）。
+      // 同名 class 重复定义时热更新旧类的原型（方法/静态成员），保持绑定不变，
+      // 旧实例立即生效且 instanceof 不破坏；首次定义时旧绑定为 undefined，
+      // patch 直接返回新类。
+      state.prepend(
+        node,
+        `${node.id!.name}=__replPatchClass(${node.id!.name}, ${node.id!.name}=`,
+      );
       state.hoistedDeclarationStatements.push(`var ${node.id!.name}; `);
       // 改写为表达式赋值后补分号：转换器（如 sucrase）可能在同一行拼接后续
       // 语句，无分号时 ASI 不生效（offending token 与前一 token 间需有换行），
       // 导致 Unexpected identifier 类语法错误
-      state.append(node, ';');
+      state.append(node, ');');
     }
     walk.base.ClassDeclaration!(node, state, c);
   },

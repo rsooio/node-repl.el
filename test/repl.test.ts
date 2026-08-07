@@ -93,6 +93,53 @@ test("ts generic class with parameter properties", async () => {
   );
 });
 
+test("redefining class updates existing instances", async () => {
+  await request(`class Counter { inc() { return 1 } }`, projRoot);
+  await request(`const c = new Counter()`, projRoot);
+  assert.equal(await request(`c.inc()`, projRoot), "1");
+  // 重定义后旧实例立即用新方法
+  await request(`class Counter { inc() { return 2 } }`, projRoot);
+  assert.equal(await request(`c.inc()`, projRoot), "2");
+  // 绑定不变：instanceof 与原型链不破坏，新实例同样用新方法
+  assert.equal(await request(`c instanceof Counter`, projRoot), "true");
+  assert.equal(await request(`new Counter().inc()`, projRoot), "2");
+});
+
+test("redefining class updates static members", async () => {
+  await request(`class Util { static version() { return 1 } }`, projRoot);
+  assert.equal(await request(`Util.version()`, projRoot), "1");
+  await request(`class Util { static version() { return 2 } }`, projRoot);
+  assert.equal(await request(`Util.version()`, projRoot), "2");
+  assert.equal(await request(`Util.version`, projRoot), "[Function: version]");
+});
+
+test("redefined class getter updates existing instances", async () => {
+  await request(`class G { get v() { return 1 } }`, projRoot);
+  await request(`const g = new G()`, projRoot);
+  assert.equal(await request(`g.v`, projRoot), "1");
+  await request(`class G { get v() { return 3 } }`, projRoot);
+  assert.equal(await request(`g.v`, projRoot), "3");
+});
+
+test("redefining parent class updates subclass instances", async () => {
+  await request(`class Base { greet() { return "base1" } }`, projRoot);
+  await request(`class Sub extends Base { extra() { return "e" } }`, projRoot);
+  await request(`const sub = new Sub()`, projRoot);
+  assert.equal(await request(`sub.greet()`, projRoot), "'base1'");
+  // 父类重定义后，子类旧实例经原型链看到新方法
+  await request(`class Base { greet() { return "base2" } }`, projRoot);
+  assert.equal(await request(`sub.greet()`, projRoot), "'base2'");
+  assert.equal(await request(`sub.extra()`, projRoot), "'e'");
+  assert.equal(await request(`sub instanceof Sub`, projRoot), "true");
+  assert.equal(await request(`sub instanceof Base`, projRoot), "true");
+});
+
+test("class can take over existing function binding", async () => {
+  await request(`function Shape() {}`, projRoot);
+  await request(`class Shape { area() { return 9 } }`, projRoot);
+  assert.equal(await request(`new Shape().area()`, projRoot), "9");
+});
+
 test("ts type errors are not checked", async () => {
   assert.equal(await request('const n: number = "str"; n', projRoot), "'str'");
 });

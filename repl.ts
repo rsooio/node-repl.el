@@ -49,6 +49,45 @@ const jsonConsole = Object.fromEntries(
 
 globalThis.console = jsonConsole;
 
+/**
+ * 顶层 class 重复定义时的热更新（配合 evaluator.utils.ts 的改写）：
+ * 把新 class 的实例方法/静态成员（含 getter/setter 描述符）复制到旧 class，
+ * 返回旧 class —— 绑定不变，旧实例的原型链与 instanceof 不破坏，方法变更
+ * 对旧实例立即生效；extends 变化时同步切换旧原型链。
+ *
+ * 局限（JS 语义使然，非实现缺陷）：constructor 本身与实例字段的初始化逻辑
+ * 无法更新——旧实例无法重建，新实例用的是旧 constructor；如需变更构造逻辑
+ * 应重启 REPL 或手动重新创建实例。
+ */
+function patchClass(oldClass: unknown, newClass: unknown): unknown {
+  if (typeof newClass !== "function") return newClass;
+  if (typeof oldClass !== "function" || oldClass === newClass) return newClass;
+  // 实例成员：复制到旧原型，旧实例立即可见
+  for (const key of Reflect.ownKeys(newClass.prototype)) {
+    if (key === "constructor") continue;
+    Object.defineProperty(
+      oldClass.prototype,
+      key,
+      Object.getOwnPropertyDescriptor(newClass.prototype, key)!,
+    );
+  }
+  // 静态成员
+  for (const key of Reflect.ownKeys(newClass)) {
+    if (key === "length" || key === "name" || key === "prototype") continue;
+    Object.defineProperty(
+      oldClass,
+      key,
+      Object.getOwnPropertyDescriptor(newClass, key)!,
+    );
+  }
+  // extends 变化：旧原型链切到新父类（子类旧实例经原型链看到新父类成员）
+  const newParent = Object.getPrototypeOf(newClass.prototype);
+  if (newParent !== Object.getPrototypeOf(oldClass.prototype)) {
+    Object.setPrototypeOf(oldClass.prototype, newParent);
+  }
+  return oldClass;
+}
+
 // 与 crawler 环境一致的基础上下文（不含 got/save/rateLimiter）
 const context = createContext({
   URLSearchParams,
@@ -59,6 +98,7 @@ const context = createContext({
   cheerio,
   setTimeout,
   console: jsonConsole,
+  __replPatchClass: patchClass,
   // esbuild format: "cjs" 会把 export 转为 module.exports 赋值
   module: { exports: {} },
   exports: {},
