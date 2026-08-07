@@ -105,6 +105,73 @@ test("redefining class updates existing instances", async () => {
   assert.equal(await request(`new Counter().inc()`, projRoot), "2");
 });
 
+test("constructor changes hot-update without restart", async () => {
+  await request(`class Foo { constructor(n) { this.n = n } double() { return this.n * 2 } }`, projRoot);
+  assert.equal(await request(`new Foo(5).double()`, projRoot), "10");
+  // 改 constructor 逻辑：新实例立即生效，instanceof 不破坏
+  await request(`class Foo { constructor(n) { this.n = n + 1 } double() { return this.n * 2 } }`, projRoot);
+  assert.equal(await request(`new Foo(5).double()`, projRoot), "12");
+  assert.equal(await request(`new Foo(5) instanceof Foo`, projRoot), "true");
+});
+
+test("class field changes hot-update", async () => {
+  await request(`class Bar { n = 1; get() { return this.n } }`, projRoot);
+  assert.equal(await request(`new Bar().get()`, projRoot), "1");
+  await request(`class Bar { n = 2; get() { return this.n } }`, projRoot);
+  assert.equal(await request(`new Bar().get()`, projRoot), "2");
+  // 新增字段也生效
+  await request(`class Bar { n = 2; m = 3; sum() { return this.n + this.m } }`, projRoot);
+  assert.equal(await request(`new Bar().sum()`, projRoot), "5");
+});
+
+test("removed methods are deleted to expose errors", async () => {
+  await request(`class Baz { a() { return 1 } b() { return 2 } }`, projRoot);
+  await request(`const z = new Baz()`, projRoot);
+  await request(`class Baz { a() { return 1 } }`, projRoot);
+  // 删除的方法：调用报错而非静默执行旧实现
+  assert.match(await request(`z.b()`, projRoot), /is not a function/);
+  assert.equal(await request(`z.a()`, projRoot), "1");
+});
+
+test("removed static members are deleted", async () => {
+  await request(`class St { static v() { return 1 } }`, projRoot);
+  assert.equal(await request(`St.v()`, projRoot), "1");
+  await request(`class St { static w() { return 2 } }`, projRoot);
+  assert.match(await request(`St.v()`, projRoot), /is not a function/);
+  assert.equal(await request(`St.w()`, projRoot), "2");
+});
+
+test("subclass constructor keeps super call", async () => {
+  await request(`class PBase { constructor(n) { this.n = n } }`, projRoot);
+  await request(`class PSub extends PBase { constructor(n) { super(n); this.m = 1 } get() { return this.n + this.m } }`, projRoot);
+  assert.equal(await request(`new PSub(1).get()`, projRoot), "2");
+  await request(`class PSub extends PBase { constructor(n) { super(n); this.m = 2 } get() { return this.n + this.m } }`, projRoot);
+  assert.equal(await request(`new PSub(1).get()`, projRoot), "3");
+});
+
+test("subclass without constructor forwards super args", async () => {
+  await request(`class QBase { constructor(n) { this.n = n } }`, projRoot);
+  await request(`class QSub extends QBase { get() { return this.n } }`, projRoot);
+  assert.equal(await request(`new QSub(7).get()`, projRoot), "7");
+});
+
+test("constructor with return is left as-is", async () => {
+  await request(`class R { constructor() { return { x: 1 } } }`, projRoot);
+  assert.equal(await request(`new R().x`, projRoot), "1");
+  // 降级：不抽取，重定义保持原样（不破坏）
+  await request(`class R { constructor() { return { x: 2 } } }`, projRoot);
+  assert.equal(await request(`new R().x`, projRoot), "1");
+});
+
+test("old instances re-run extracted init", async () => {
+  await request(`class O { constructor(n) { this.n = n } }`, projRoot);
+  await request(`const o = new O(1)`, projRoot);
+  await request(`class O { constructor(n) { this.n = n * 10 } }`, projRoot);
+  // 旧实例状态保留，可手动重跑抽取的初始化
+  assert.equal(await request(`o.n`, projRoot), "1");
+  assert.equal(await request(`o.__replInit(5); o.n`, projRoot), "50");
+});
+
 test("redefining class updates static members", async () => {
   await request(`class Util { static version() { return 1 } }`, projRoot);
   assert.equal(await request(`Util.version()`, projRoot), "1");

@@ -51,17 +51,36 @@ globalThis.console = jsonConsole;
 
 /**
  * 顶层 class 重复定义时的热更新（配合 evaluator.utils.ts 的改写）：
- * 把新 class 的实例方法/静态成员（含 getter/setter 描述符）复制到旧 class，
- * 返回旧 class —— 绑定不变，旧实例的原型链与 instanceof 不破坏，方法变更
- * 对旧实例立即生效；extends 变化时同步切换旧原型链。
+ * 把旧类同步到新类的成员集合（全量替换语义）：新类已移除的实例方法/静态
+ * 成员从旧类删除（调用时报 is not a function，暴露删除，不静默保留旧实现），
+ * 新类的成员按描述符复制到旧类（含 getter/setter）。返回旧 class —— 绑定
+ * 不变，旧实例的原型链与 instanceof 不破坏，旧实例立即生效；extends 变化
+ * 时同步切换旧原型链。
  *
- * 局限（JS 语义使然，非实现缺陷）：constructor 本身与实例字段的初始化逻辑
- * 无法更新——旧实例无法重建，新实例用的是旧 constructor；如需变更构造逻辑
- * 应重启 REPL 或手动重新创建实例。
+ * 构造逻辑经 evaluator.utils.ts 抽取为原型方法 __replInit（每次重定义重新
+ * 生成），constructor 只委托调用，因此 constructor/字段初始化变更同样热
+ * 更新：新实例构造时动态分派到新版 __replInit，旧实例可调 f.__replInit(...)
+ * 重跑初始化。降级场景（用户占用 __replInit 名、constructor 含 return/
+ * new.target）不抽取，构造变更不热更新。
  */
 function patchClass(oldClass: unknown, newClass: unknown): unknown {
   if (typeof newClass !== "function") return newClass;
   if (typeof oldClass !== "function" || oldClass === newClass) return newClass;
+  const hasOwn = (o: object, k: PropertyKey) =>
+    Object.prototype.hasOwnProperty.call(o, k);
+  // 全量同步：删除新类已移除的旧成员
+  for (const key of Reflect.ownKeys(oldClass.prototype)) {
+    if (key === "constructor") continue;
+    if (!hasOwn(newClass.prototype, key)) {
+      delete (oldClass.prototype as Record<PropertyKey, unknown>)[key];
+    }
+  }
+  for (const key of Reflect.ownKeys(oldClass)) {
+    if (key === "length" || key === "name" || key === "prototype") continue;
+    if (!hasOwn(newClass, key)) {
+      delete (oldClass as Record<PropertyKey, unknown>)[key];
+    }
+  }
   // 实例成员：复制到旧原型，旧实例立即可见
   for (const key of Reflect.ownKeys(newClass.prototype)) {
     if (key === "constructor") continue;
