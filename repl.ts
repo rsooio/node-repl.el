@@ -10,15 +10,18 @@
  *
  * 有 cwd 时向 context 注入 createRequire(cwd)，代码内可用 require() 加载
  * 该项目的 node_modules 依赖（仅 require，不提供 import）。
- * 代码先经 esbuild 擦除 TS 类型（loader: tsx，含 JSX）再求值，不检查类型。
- * 每个请求串行执行，vm context 跨请求保留（变量、函数、类可持续使用）。
+ * 代码先经 sucrase 擦除 TS 类型并把 import/export/import() 转为
+ * require/module.exports（transforms: typescript, imports, jsx），
+ * 顶层 await 保留原样（async IIFE 内合法）。
+ * 每个请求串行执行，vm context 跨请求保留。
  * 运行：pnpm start（或 pnpm exec tsx repl.ts）
  */
 
 import { createContext, runInContext } from "node:vm";
 import { createRequire } from "node:module";
 import { inspect } from "node:util";
-import { transform } from "esbuild";
+import { transform } from "sucrase";
+import { parse } from "acorn";
 import { CookieJar } from "tough-cookie";
 import * as cheerio from "cheerio";
 import { processCode } from "./evaluator.utils.ts";
@@ -53,7 +56,33 @@ const context = createContext({
   cheerio,
   setTimeout,
   console: jsonConsole,
+  // esbuild format: "cjs" 会把 export 转为 module.exports 赋值
+  module: { exports: {} },
+  exports: {},
 });
+
+// 当前注入的项目 require（cwd 变化时更新 context）
+let projectCwd: string | undefined;
+
+/**
+ * 擦除 TS 类型并把模块语法转为 CJS：
+ * - import 语句 → require（含 default/命名/命名空间/副作用，引用同步重写）
+ * - export → exports/module.exports 赋值
+ * - 动态 import() → Promise.resolve().then(() => require(...))
+ * - 顶层 await 保留原样（processCode 包装的 async IIFE 内合法）
+ */
+function transformCode(code: string): string {
+  let js = transform(code, {
+    transforms: ["typescript", "imports", "jsx"],
+  }).code;
+  // sucrase 注入的 "use strict" 是字符串语句，会被 processCode 当作
+  // 最后一个表达式返回（如 import 单独一行时结果变成 'use strict'）；
+  // vm 非严格环境无需它，去掉。
+  if (js.startsWith('"use strict";')) {
+    js = js.slice('"use strict";'.length);
+  }
+  return js;
+}
 
 function respond(result: string): void {
   process.stdout.write(`${JSON.stringify({ type: "result", result })}\n`);
@@ -69,8 +98,44 @@ process.on("uncaughtException", (err) => {
   process.stderr.write(`uncaughtException: ${err}\n`);
 });
 
-// 当前注入的项目 require（cwd 变化时更新 context）
-let projectCwd: string | undefined;
+/**
+ * 解析代码中的 import 声明，生成同名顶层绑定语句（跨请求可用）：
+ * - default: var x = (m => m && m.__esModule ? m.default : m)(require("pkg"))
+ * - named/别名: var x = require("pkg").prop
+ * - namespace: var x = require("pkg")
+ * sucrase 只重写同一份代码内的引用，绑定让后续请求也能使用导入名。
+ * 解析失败（如含 JSX）时返回空串，仅首次请求内可用。
+ */
+function buildImportBindings(code: string): string {
+  try {
+    const ast = parse(code, {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      allowImportExportEverywhere: true,
+    });
+    const lines: string[] = [];
+    for (const node of ast.body) {
+      if (node.type !== "ImportDeclaration") continue;
+      const spec = JSON.stringify(node.source.value);
+      for (const s of node.specifiers) {
+        if (s.type === "ImportDefaultSpecifier") {
+          lines.push(
+            `var ${s.local.name} = (function (m) { return m && m.__esModule ? m.default : m; })(require(${spec}));`,
+          );
+        } else if (s.type === "ImportSpecifier") {
+          const prop =
+            s.imported.type === "Identifier" ? s.imported.name : s.imported.value;
+          lines.push(`var ${s.local.name} = require(${spec}).${prop};`);
+        } else {
+          lines.push(`var ${s.local.name} = require(${spec});`);
+        }
+      }
+    }
+    return lines.join("\n");
+  } catch {
+    return "";
+  }
+}
 
 function evalCode(req: { code: string; cwd?: string }): Promise<void> {
   return (async () => {
@@ -79,11 +144,13 @@ function evalCode(req: { code: string; cwd?: string }): Promise<void> {
         context.require = createRequire(`${req.cwd}/`);
         projectCwd = req.cwd;
       }
-      // 擦除 TS 类型（含 JSX），类型错误不检查
-      const { code: js } = await transform(req.code, {
-        loader: "tsx",
-        target: "esnext",
-      });
+      const bindings = buildImportBindings(req.code);
+      const js = transformCode(req.code);
+      // 绑定单独执行：var 声明落到 context 属性，与用户代码同 Script 的
+      // 词法声明（const/let 同名）不冲突；后续请求通过属性使用导入名
+      if (bindings) {
+        await runInContext(processCode(bindings), context);
+      }
       const processedCode = processCode(js);
       const value = (await runInContext(processedCode, context))?.value;
       respond(inspect(value, { depth: null, maxArrayLength: 200 }));
