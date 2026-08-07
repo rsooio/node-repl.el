@@ -37,7 +37,10 @@ const jsonConsole = Object.fromEntries(
         `${JSON.stringify({
           type: "console",
           method: type,
-          args: inspect(args, { depth: 4 }),
+          args: args.map((a) => {
+            if (["string", "number", "boolean"].includes(typeof a)) return a;
+            return inspect(a, { depth: 4 });
+          }),
         })}\n`,
       );
     },
@@ -61,8 +64,8 @@ const context = createContext({
   exports: {},
 });
 
-// 当前注入的项目 require（cwd 变化时更新 context）
-let projectCwd: string | undefined;
+// 当前注入的项目 require 基准（fileDir 变化时更新 context）
+let requireBase: string | undefined;
 
 /**
  * 擦除 TS 类型并把模块语法转为 CJS：
@@ -75,12 +78,13 @@ function transformCode(code: string): string {
   let js = transform(code, {
     transforms: ["typescript", "imports", "jsx"],
   }).code;
-  // sucrase 注入的 "use strict" 是字符串语句，会被 processCode 当作
-  // 最后一个表达式返回（如 import 单独一行时结果变成 'use strict'）；
-  // vm 非严格环境无需它，去掉。
-  if (js.startsWith('"use strict";')) {
-    js = js.slice('"use strict";'.length);
-  }
+  // 去掉 sucrase 注入的模块前缀："use strict" 是字符串语句、__esModule 标记
+  // 是表达式语句，都会被 processCode 当作最后表达式返回；vm 非严格环境
+  // 无需它们
+  js = js.replace(/^"use strict";/, "");
+  js = js.replace(
+    /^Object\.defineProperty\(exports, "__esModule", \{value: true\}\);/, "",
+  );
   return js;
 }
 
@@ -110,7 +114,8 @@ function buildImportBindings(code: string): string {
   try {
     const ast = parse(code, {
       ecmaVersion: "latest",
-      sourceType: "module",
+      // script + allowImportExportEverywhere：只解析语法，不做模块语义检查
+      sourceType: "script",
       allowImportExportEverywhere: true,
     });
     const lines: string[] = [];
@@ -137,15 +142,57 @@ function buildImportBindings(code: string): string {
   }
 }
 
-function evalCode(req: { code: string; cwd?: string }): Promise<void> {
+/**
+ * 移除 export 语句：REPL 无模块消费者，export 不产生任何效果，
+ * 且 sucrase 生成的 exports 赋值表达式会被 processCode 当作返回值。
+ * - export const/class/function: 删除 "export " 前缀，保留声明
+ * - export default/export {}/export *: 删除整条语句
+ * 解析失败（如含 JSX）时原样返回（export 由 sucrase 转换兜底）。
+ */
+function stripExports(code: string): string {
+  try {
+    const ast = parse(code, {
+      ecmaVersion: "latest",
+      // script + allowImportExportEverywhere：跳过模块语义检查
+      //（如 "Export 'a' is not defined"），只解析语法
+      sourceType: "script",
+      allowImportExportEverywhere: true,
+    });
+    const nodes = ast.body.filter((n) => n.type.startsWith("Export"));
+    if (nodes.length === 0) return code;
+    let result = code;
+    // 从后往前处理，避免偏移错乱
+    for (const n of [...nodes].reverse()) {
+      if (n.type === "ExportNamedDeclaration" && n.declaration) {
+        result = result.slice(0, n.start) + result.slice(n.declaration.start);
+      } else {
+        result = result.slice(0, n.start) + result.slice(n.end);
+      }
+    }
+    return result;
+  } catch {
+    return code;
+  }
+}
+
+function evalCode(req: {
+  code: string;
+  cwd?: string;
+  fileDir?: string;
+}): Promise<void> {
   return (async () => {
     try {
-      if (req.cwd && req.cwd !== projectCwd) {
-        context.require = createRequire(`${req.cwd}/`);
-        projectCwd = req.cwd;
+      // require 基准用代码所在目录：相对 import/require 按文件解析，
+      // 依赖解析沿目录向上找 node_modules；回退 cwd
+      const base = req.fileDir ?? req.cwd;
+      if (base && base !== requireBase) {
+        // 用假文件名而非目录：避免 Node 把目录按 package.json main 解析
+        context.require = createRequire(`${base}/__repl__.js`);
+        requireBase = base;
       }
-      const bindings = buildImportBindings(req.code);
-      const js = transformCode(req.code);
+      const code = stripExports(req.code);
+      const bindings = buildImportBindings(code);
+      const js = transformCode(code);
       // 绑定单独执行：var 声明落到 context 属性，与用户代码同 Script 的
       // 词法声明（const/let 同名）不冲突；后续请求通过属性使用导入名
       if (bindings) {
@@ -174,7 +221,11 @@ process.stdin.on("data", (chunk: string) => {
     if (!line) continue;
     queue = queue.then(() => {
       try {
-        const req = JSON.parse(line) as { code?: unknown; cwd?: unknown };
+        const req = JSON.parse(line) as {
+          code?: unknown;
+          cwd?: unknown;
+          fileDir?: unknown;
+        };
         if (typeof req.code !== "string") {
           respond("请求缺少 code 字段");
           return;
@@ -183,7 +234,11 @@ process.stdin.on("data", (chunk: string) => {
           respond("请求 cwd 字段必须是字符串");
           return;
         }
-        return evalCode({ code: req.code, cwd: req.cwd });
+        if (req.fileDir !== undefined && typeof req.fileDir !== "string") {
+          respond("请求 fileDir 字段必须是字符串");
+          return;
+        }
+        return evalCode({ code: req.code, cwd: req.cwd, fileDir: req.fileDir });
       } catch (err) {
         respond(`请求解析失败: ${err}`);
       }

@@ -138,9 +138,7 @@
               ("console"
                (node-repl--append
                 (node-repl--buffer server)
-                (format "%s %s\n"
-                        (alist-get 'method msg)
-                        (alist-get 'args msg)))))))))))
+                (format "%s\n" (string-join (alist-get 'args msg) " ")))))))))))
 
 (defun node-repl--sentinel (server _event)
   (when (string-match-p "\\`\\(finished\\|deleted\\)" _event)
@@ -272,23 +270,28 @@
   "在当前项目的 REPL 中求值 CODE，代码与响应追加到该实例的 transcript buffer。
 
 交互式调用时 CODE 取当前 JS/TS 文件顶层节点或选区（见 `node-repl--code'）。"
-  (interactive (list (node-repl--code)))
+  (interactive (list (string-trim (node-repl--code))))
   (unless code
     (user-error "没有可求值的代码：需在 JS/TS 文件顶层节点上或选中区域"))
   (let ((server (node-repl-current-server)))
     (unless server
       (user-error "当前项目的 node-repl 未启动，先执行 M-x node-repl-start"))
     (node-repl--append (node-repl--buffer server)
-                       (format "> %s\n" code) 'comint-highlight-prompt)
+                       (format "> %s\n" (string-replace "\n" "\n> " code))
+                       'comint-highlight-prompt)
     (setf (node-repl--queue server)
           (append (node-repl--queue server)
                   (list (lambda (r)
                           (node-repl--append (node-repl--buffer server)
-                                             (format "%s\n\n" r))))))
+                                             (format "=> %s\n\n" r))))))
     (process-send-string
      (node-repl--process server)
      (concat (json-encode `(("code" . ,code)
-                            ("cwd" . ,(node-repl--project server))))
+                            ("cwd" . ,(node-repl--project server))
+                            ("fileDir" . ,(or (and buffer-file-name
+                                                    (file-name-directory
+                                                     buffer-file-name))
+                                               default-directory))))
              "\n")))
   nil)
 

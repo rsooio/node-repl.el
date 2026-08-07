@@ -59,8 +59,8 @@ function sendRaw(line: string): Promise<string> {
   return p;
 }
 
-function request(code: string, cwd?: string): Promise<string> {
-  return sendRaw(JSON.stringify({ code, cwd }));
+function request(code: string, cwd?: string, fileDir?: string): Promise<string> {
+  return sendRaw(JSON.stringify({ code, cwd, fileDir }));
 }
 
 before(start);
@@ -182,8 +182,45 @@ test("dynamic import", async () => {
   assert.equal(await request(`const m = await import("acorn"); m.version`, projRoot), "'8.18.0'");
 });
 
-test("export writes to module.exports stub", async () => {
+test("export keyword is stripped, declaration kept", async () => {
+  // export const 移去关键字后只剩 const 声明，不求值
+  assert.equal(await request("export const c = 3;", projRoot), "undefined");
+  // 声明仍可用；后续表达式正常求值
+  assert.equal(await request("c", projRoot), "3");
   assert.equal(await request("export const x = 42; x", projRoot), "42");
+});
+
+test("export class stripped", async () => {
+  assert.equal(await request(`export class C {}`, projRoot), "undefined");
+  assert.equal(await request(`typeof C`, projRoot), "'function'");
+});
+
+test("export function stripped", async () => {
+  assert.equal(await request(`export function f() { return 7 }`, projRoot), "undefined");
+  assert.equal(await request(`f()`, projRoot), "7");
+});
+
+test("export default and bare export stripped", async () => {
+  assert.equal(await request(`const a = 1
+export default a`, projRoot), "undefined");
+  assert.equal(await request(`export { a }`, projRoot), "undefined");
+});
+
+test("export class combined with other statements", async () => {
+  assert.equal(
+    await request(`export class C {}
+const c = 3;`, projRoot),
+    "undefined", // 最后语句是声明，不求值
+  );
+  assert.equal(await request(`typeof C`, projRoot), "'function'");
+});
+
+test("export function combined", async () => {
+  assert.equal(
+    await request(`export function f() { return 7 }
+f()`, projRoot),
+    "7",
+  );
 });
 
 test("top-level await only", async () => {
@@ -203,6 +240,18 @@ test("require loads project dependency", async () => {
 test("require missing dependency reports error", async () => {
   const result = await request(`require("no-such-pkg-xyz")`, projRoot);
   assert.match(result, /^Error: Cannot find module/);
+});
+
+test("relative import resolves against fileDir", async () => {
+  // fileDir 基准：相对路径按代码所在目录解析（含 .ts 扩展）
+  assert.equal(
+    await request(
+      `import { VK } from "./constants"; VK`,
+      projRoot,
+      path.join(root, "test", "fixtures"),
+    ),
+    "'vk-value'",
+  );
 });
 
 test("runtime error", async () => {

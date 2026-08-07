@@ -13,6 +13,10 @@ const visitorsWithoutAncestors: RecursiveVisitors<any> = {
     if (isTopLevelDeclaration(state)) {
       state.prepend(node, `${node.id!.name}=`);
       state.hoistedDeclarationStatements.push(`var ${node.id!.name}; `);
+      // 改写为表达式赋值后补分号：转换器（如 sucrase）可能在同一行拼接后续
+      // 语句，无分号时 ASI 不生效（offending token 与前一 token 间需有换行），
+      // 导致 Unexpected identifier 类语法错误
+      state.append(node, ';');
     }
     walk.base.ClassDeclaration!(node, state, c);
   },
