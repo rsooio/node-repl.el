@@ -22,8 +22,9 @@
 ;;     {"type": "result",  "result": "<结果或错误文本>"}
 ;;     {"type": "console", "method": "log", "args": "<inspect 文本>"}
 ;;
-;; 服务端用 esbuild 擦除 TS 类型后求值，并向 context 注入项目的
-;; createRequire（代码内可用 require() 加载项目依赖）。变量跨请求保留。
+;; 服务端由 node 直接运行 repl.ts（Node >= 23.6 原生 TS 类型擦除），模块语法
+;; 经 sucrase 转译后求值，并向 context 注入项目的 createRequire（代码内可用
+;; require() 加载项目依赖）。变量跨请求保留。
 
 ;;; Code:
 
@@ -34,9 +35,9 @@
   "Node evaluator stdio REPL."
   :group 'processes)
 
-(defcustom node-repl-tsx-command "tsx"
-  "tsx 可执行文件名或路径。
-找不到时回退到脚本目录下的 node_modules/.bin/tsx。"
+(defcustom node-repl-node-command "node"
+  "node 可执行文件名或路径。
+需要 Node >= 23.6（默认启用 TS 类型擦除）。"
   :type 'string
   :group 'node-repl)
 
@@ -80,13 +81,9 @@
 
 ;;; 工具
 
-(defun node-repl--tsx-path ()
-  (let ((local (expand-file-name
-                "node_modules/.bin/tsx"
-                (file-name-directory node-repl-script-path))))
-    (cond ((file-executable-p local) local)
-          ((executable-find node-repl-tsx-command))
-          (t (error "未找到 tsx，请设置 node-repl-tsx-command")))))
+(defun node-repl--node-path ()
+  (or (executable-find node-repl-node-command)
+      (error "未找到 node，请设置 node-repl-node-command")))
 
 (defun node-repl--project-root ()
   "当前 buffer 的项目根（向上找 package.json，统一为绝对路径），nil 表示不在项目中。"
@@ -197,7 +194,7 @@
           (make-process
            :name (format "node-repl-%s" name)
            :buffer buffer
-           :command (list (node-repl--tsx-path) node-repl-script-path)
+           :command (list (node-repl--node-path) node-repl-script-path)
            :coding '(utf-8-unix . utf-8-unix)
            ;; 显式指定 pipe：batch 模式下默认不创建 stdin 管道，数据无法到达子进程
            :connection-type 'pipe

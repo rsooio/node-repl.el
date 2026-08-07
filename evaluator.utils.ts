@@ -1,6 +1,7 @@
-import { BlockStatement, parse } from "acorn";
-import { RecursiveVisitors } from "acorn-walk";
+import { parse } from "acorn";
+import type { BlockStatement } from "acorn";
 import * as walk from "acorn-walk";
+import type { RecursiveVisitors } from "acorn-walk";
 
 function isTopLevelDeclaration(state: any) {
   return state.ancestors[state.ancestors.length - 2] === state.body;

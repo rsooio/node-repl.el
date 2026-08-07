@@ -14,14 +14,17 @@
  * require/module.exports（transforms: typescript, imports, jsx），
  * 顶层 await 保留原样（async IIFE 内合法）。
  * 每个请求串行执行，vm context 跨请求保留。
- * 运行：pnpm start（或 pnpm exec tsx repl.ts）
+ * 运行：pnpm start（即 node repl.ts，Node >= 23.6 原生类型擦除）
  */
 
 import { createContext, runInContext } from "node:vm";
 import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { inspect } from "node:util";
 import { transform } from "sucrase";
 import { parse } from "acorn";
+import * as walk from "acorn-walk";
 import { CookieJar } from "tough-cookie";
 import * as cheerio from "cheerio";
 import { processCode } from "./evaluator.utils.ts";
@@ -151,6 +154,52 @@ function respond(result: string): void {
   process.stdout.write(`${JSON.stringify({ type: "result", result })}\n`);
 }
 
+/**
+ * 给相对路径的 require 补 .ts/.tsx 扩展名：node 的 createRequire 不像 tsx
+ * 那样自动解析无扩展名的 .ts 相对路径，sucrase 转译的 require("./x") 需
+ * 显式 require("./x.ts")。仅当对应 TS 文件存在时补；非相对路径、已有
+ * 扩展名（.js/.json 等）保持原样。解析失败时原样返回。
+ */
+function fixRequireExtensions(js: string, base: string): string {
+  try {
+    const ast = parse(js, {
+      ecmaVersion: "latest",
+      sourceType: "script",
+      allowImportExportEverywhere: true,
+    });
+    const edits: { start: number; end: number; text: string }[] = [];
+    walk.simple(ast, {
+      CallExpression(node: any) {
+        if (node.callee?.type !== "Identifier" || node.callee.name !== "require") return;
+        const arg = node.arguments?.[0];
+        if (!arg || arg.type !== "Literal" || typeof arg.value !== "string") return;
+        const spec = arg.value;
+        if (!/^\.{1,2}\//.test(spec) || /\.[a-zA-Z0-9]+$/.test(spec)) return;
+        for (const ext of [".ts", ".tsx"]) {
+          if (existsSync(join(base, spec + ext))) {
+            edits.push({
+              start: arg.start,
+              end: arg.end,
+              text: JSON.stringify(spec + ext),
+            });
+            return;
+          }
+        }
+      },
+    });
+    if (edits.length === 0) return js;
+    let result = "";
+    let cursor = 0;
+    for (const e of edits) {
+      result += js.slice(cursor, e.start) + e.text;
+      cursor = e.end;
+    }
+    return result + js.slice(cursor);
+  } catch {
+    return js;
+  }
+}
+
 // vm 代码中的异步错误（未 await 的 promise 等）会逃出 evalCode 的 try/catch，
 // 不能因此杀死 REPL：记录到 stderr（显示在 transcript buffer），进程保持存活。
 // 注意：这些错误无法关联到具体请求，不能走 respond（会破坏请求-响应配对）。
@@ -251,11 +300,18 @@ function evalCode(req: {
       }
       const code = stripExports(req.code);
       const bindings = buildImportBindings(code);
-      const js = transformCode(code);
+      let js = transformCode(code);
+      // node 的 createRequire 不解析无扩展名的 .ts 相对路径，补扩展名
+      if (base) {
+        js = fixRequireExtensions(js, base);
+      }
       // 绑定单独执行：var 声明落到 context 属性，与用户代码同 Script 的
       // 词法声明（const/let 同名）不冲突；后续请求通过属性使用导入名
       if (bindings) {
-        await runInContext(processCode(bindings), context);
+        await runInContext(
+          processCode(base ? fixRequireExtensions(bindings, base) : bindings),
+          context,
+        );
       }
       const processedCode = processCode(js);
       const value = (await runInContext(processedCode, context))?.value;

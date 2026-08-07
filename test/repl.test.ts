@@ -1,5 +1,5 @@
-// 服务端协议测试：spawn repl.ts，按 JSONL 协议请求/断言响应。
-// 运行：pnpm test:repl（tsx --test test/repl.test.ts）
+// 服务端协议测试：spawn 当前 node 直接运行 repl.ts，按 JSONL 协议请求/断言响应。
+// 运行：pnpm test:repl（node --test test/repl.test.ts）
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const tsx = path.join(root, "node_modules", ".bin", "tsx");
+// 用当前 node 直接跑 repl.ts（Node ≥ 23.6 默认类型擦除，无需 tsx）
 const replScript = path.join(root, "repl.ts");
 const projRoot = root; // node-repl 自身作为测试项目（有 acorn 等依赖）
 const otherProj = path.resolve(root, "..", "auto-bidding-v2");
@@ -18,7 +18,7 @@ let stderrText = "";
 const messages: { type: string; result?: string; args?: string }[] = [];
 
 function start(): void {
-  child = spawn(tsx, [replScript]);
+  child = spawn(process.execPath, [replScript]);
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   child.stdout.on("data", (d: string) => {
