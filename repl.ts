@@ -48,7 +48,7 @@ const jsonConsole = Object.fromEntries(
       );
     },
   ]),
-) as Console;
+) as unknown as Console;
 
 globalThis.console = jsonConsole;
 
@@ -81,7 +81,7 @@ function patchClass(oldClass: unknown, newClass: unknown): unknown {
   for (const key of Reflect.ownKeys(oldClass)) {
     if (key === "length" || key === "name" || key === "prototype") continue;
     if (!hasOwn(newClass, key)) {
-      delete (oldClass as Record<PropertyKey, unknown>)[key];
+      delete (oldClass as unknown as Record<PropertyKey, unknown>)[key];
     }
   }
   // 实例成员：复制到旧原型，旧实例立即可见

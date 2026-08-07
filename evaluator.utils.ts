@@ -196,14 +196,14 @@ const visitorsWithoutAncestors: RecursiveVisitors<any> = {
       }
 
       const variableIdentifiersToHoist: string[] = [];
-      function registerVariableDeclarationIdentifiers(node) {
+      function registerVariableDeclarationIdentifiers(node: any) {
         switch (node.type) {
           case 'Identifier':
             variableIdentifiersToHoist.push(node.name);
             break;
           case 'ObjectPattern':
             node.properties
-              .map((property) => property.value || property.argument)
+              .map((property: any) => property.value || property.argument)
               .forEach(registerVariableDeclarationIdentifiers);
             break;
           case 'ArrayPattern':
@@ -227,18 +227,23 @@ const visitorsWithoutAncestors: RecursiveVisitors<any> = {
   },
 };
 
-const vistors = {};
+type Walker = (node: any, state: any, c: (node: any, state: any, c: any) => void) => void;
+
+const vistors: Record<string, Walker> = {};
 for (const nodeType of Object.keys(walk.base)) {
   vistors[nodeType] = (node, state, c) => {
     const isNew = node !== state.ancestors[state.ancestors.length - 1];
     if (isNew) state.ancestors.push(node);
-    (visitorsWithoutAncestors[nodeType] || walk.base[nodeType])(node, state, c);
+    ((visitorsWithoutAncestors as Record<string, Walker>)[nodeType] ||
+      (walk.base as Record<string, Walker>)[nodeType])(node, state, c);
     if (isNew) state.ancestors.pop();
   }
 }
 
 export function processCode(code: string) {
-  const wrapped = `(async () => { ${code} })()`;
+  // 前后加换行：代码以行注释结尾时（如 "// a = 1"），`//` 会注释到行尾并
+  // 吞掉包装的 `})()`，无换行则解析报 Unexpected token
+  const wrapped = `(async () => {\n${code}\n})()`;
   const root = parse(wrapped, {
     ecmaVersion: "latest",
     sourceType: "script",
@@ -252,20 +257,20 @@ export function processCode(code: string) {
     body,
     ancestors: [],
     hoistedDeclarationStatements: [],
-    slice(from, to) {
+    slice(from: number, to: number) {
       return wrappedArray.slice(from, to).join('');
     },
-    replace(from, to, str) {
+    replace(from: number, to: number, str: string) {
       for (let i = from; i < to; i++) {
         wrappedArray[i] = '';
       }
       if (from === to) str += wrappedArray[from];
       wrappedArray[from] = str;
     },
-    prepend(node, str) {
+    prepend(node: any, str: string) {
       wrappedArray[node.start] = str + wrappedArray[node.start];
     },
-    append(node, str) {
+    append(node: any, str: string) {
       wrappedArray[node.end - 1] += str;
     },
   };

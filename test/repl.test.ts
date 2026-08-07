@@ -344,6 +344,19 @@ test("top-level await only", async () => {
   );
 });
 
+test("line comment only", async () => {
+  assert.equal(await request("// a = 1", projRoot), "undefined");
+});
+
+test("trailing line comment", async () => {
+  assert.equal(await request("1 + 1 // note", projRoot), "2");
+  assert.equal(await request("// note with */ inside\n2 + 2", projRoot), "4");
+});
+
+test("block comment only", async () => {
+  assert.equal(await request("/* a = 1 */", projRoot), "undefined");
+});
+
 test("require loads project dependency", async () => {
   assert.equal(
     await request(`require("tough-cookie").CookieJar !== undefined`, projRoot),
