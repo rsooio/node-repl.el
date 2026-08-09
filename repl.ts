@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * Evaluator stdio REPL
  *
