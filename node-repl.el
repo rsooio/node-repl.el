@@ -2,29 +2,31 @@
 
 ;;; Commentary:
 
-;; 项目级 node-repl：每个项目（由 package.json 标识）一个独立 REPL 实例，
-;; 模型与 eglot 一致——实例自包含、buffer-local 关联、索引仅用于查找：
+;; Project-level node-repl: one REPL instance per project (identified by
+;; package.json), modeled after eglot -- self-contained instances, buffer-local
+;; association, and an index used only for lookup:
 ;;
-;;   (node-repl-start)   在当前 buffer 的项目手动启动 REPL（已运行则询问重启）
-;;   (node-repl-stop)    停止当前项目的 REPL
-;;   (node-repl-eval)    求值当前 JS/TS 文件顶层节点或选区，未启动则提示
+;;   (node-repl-ensure)    Ensure a REPL runs for the current project (asks to restart if running)
+;;   (node-repl-shutdown)  Shut down the REPL of the current project
+;;   (node-repl-eval)      Evaluate the top-level JS/TS node at point or the region, if not started
 ;;
-;; 启动后 C-M-x 在 js/ts treesit major mode 中绑定到 node-repl-eval（任一
-;; 实例运行时绑定，全部停止后恢复）。代码与结果以 REPL transcript 形式
-;; 显示在 *node-repl: <包名>* buffer：
+;; Once started, C-M-x is bound to node-repl-eval in js/ts treesit major modes
+;; (bound while any instance runs, restored when all stop). Code and results
+;; are shown as a REPL transcript in the *node-repl: <package>* buffer:
 ;;
 ;;                         > 1 + 1
 ;;                         2
 ;;
-;; 协议（JSONL，UTF-8）：
-;;   请求：一行 JSON  {"code": "<JS/TS 代码>", "cwd": "<项目根>"}
-;;   响应：一行 JSON：
-;;     {"type": "result",  "result": "<结果或错误文本>"}
-;;     {"type": "console", "method": "log", "args": ["<字符串参数原样>", <数字/布尔参数原样>]}
+;; Protocol (JSONL, UTF-8):
+;;   Request: one JSON line  {"code": "<JS/TS code>", "cwd": "<project root>"}
+;;   Response: one JSON line:
+;;     {"type": "result",  "result": "<result or error text>"}
+;;     {"type": "console", "method": "log", "args": ["<string args as-is>", <number/boolean args as-is>]}
 ;;
-;; 服务端由 node 直接运行 repl.ts（Node >= 23.6 原生 TS 类型擦除），模块语法
-;; 经 sucrase 转译后求值，并向 context 注入项目的 createRequire（代码内可用
-;; require() 加载项目依赖）。变量跨请求保留。
+;; The server runs repl.ts directly with node (Node >= 23.6 native TS type
+;; stripping); module syntax is transpiled by sucrase before evaluation, and
+;; the project's createRequire is injected into the context (code can load
+;; project dependencies with require()). Variables persist across requests.
 
 ;;; Code:
 
@@ -36,8 +38,8 @@
   :group 'processes)
 
 (defcustom node-repl-node-command "node"
-  "node 可执行文件名或路径。
-需要 Node >= 23.6（默认启用 TS 类型擦除）。"
+  "Executable name or path of the node binary.
+Requires Node >= 23.6 (native TS type stripping enabled by default)."
   :type 'string
   :group 'node-repl)
 
@@ -45,54 +47,54 @@
   (expand-file-name
    "repl.ts"
    (file-name-directory (or load-file-name buffer-file-name default-directory)))
-  "REPL 入口脚本 repl.ts 的路径。"
+  "Path to the REPL entry script repl.ts."
   :type 'file
   :group 'node-repl)
 
-;;; 实例结构（自包含，无外部管理器）
+;;; Instance structure (self-contained, no external manager)
 
 (cl-defstruct (node-repl--server
                (:constructor node-repl--make-server)
                (:conc-name node-repl--))
-  project        ; 项目根目录
-  process        ; node-repl 主进程
-  stderr         ; stderr 转发 pipe process
-  buffer         ; *node-repl: <包名>*
-  output         ; stdout 未解析缓冲
-  queue          ; 响应回调队列（FIFO）
-  buffers)       ; 关联 buffer 列表（eglot--managed-buffers 同款），停止/退出时按列表清缓存
+  project          ; project root directory
+  process          ; node-repl main process
+  stderr           ; stderr forwarding pipe process
+  buffer           ; *node-repl: <package>*
+  output           ; unparsed stdout buffer
+  queue            ; response callback queue (FIFO)
+  managed-buffers) ; associated buffers (like eglot--managed-buffers); caches cleared on stop/exit
 
-;;; 查找索引（仅用于按项目查找实例，无生命周期职责）
+;;; Lookup index (instance lookup by project only, no lifecycle duties)
 
 (defvar node-repl--servers-by-project (make-hash-table :test #'equal))
 
-;;; buffer-local 关联缓存（eglot--cached-server 同款）
+;;; Buffer-local association cache (like eglot--cached-server)
 
-(defvar-local node-repl--server nil
-  "当前 buffer 关联的 REPL 实例，nil 表示未关联。")
+(defvar-local node-repl--cached-server nil
+  "A cached reference to the REPL instance for this buffer, nil if not associated.")
 
 (defvar node-repl--saved-bindings nil
-  "已保存的 C-M-x 原绑定：((KEYMAP . COMMAND) ...)")
+  "Saved C-M-x bindings: ((KEYMAP . COMMAND) ...)")
 (defvar node-repl--bindings-active nil
-  "C-M-x 绑定是否已生效（任一实例运行时为 t）。")
+  "Non-nil while the C-M-x bindings are installed (any instance running).")
 
 (defvar node-repl--mode-map-symbols
   '(javascript-ts-mode-map js-ts-mode-map typescript-ts-mode-map tsx-ts-mode-map)
-  "要绑定的 major mode keymap 符号（按存在性逐个启用）。")
+  "Major-mode keymap symbols to bind C-M-x in (enabled per availability).")
 
-;;; 工具
+;;; Utilities
 
 (defun node-repl--node-path ()
   (or (executable-find node-repl-node-command)
-      (error "未找到 node，请设置 node-repl-node-command")))
+      (error "node not found; set `node-repl-node-command'")))
 
 (defun node-repl--project-root ()
-  "当前 buffer 的项目根（向上找 package.json，统一为绝对路径），nil 表示不在项目中。"
+  "Project root of the current buffer (nearest ancestor with package.json, absolute), nil if not in a project."
   (when-let* ((dir (locate-dominating-file default-directory "package.json")))
     (expand-file-name dir)))
 
 (defun node-repl--project-name (project)
-  "取项目的包名，失败时回退目录名。"
+  "Package name of PROJECT, falling back to the directory name."
   (let ((pkg (expand-file-name "package.json" project)))
     (condition-case nil
         (or (alist-get 'name (json-read-file pkg))
@@ -100,7 +102,7 @@
       (error (file-name-nondirectory (directory-file-name project))))))
 
 (defun node-repl--append (buffer text &optional face)
-  "在 BUFFER 末尾追加 TEXT（可选 FACE 高亮），并滚动到可见位置。"
+  "Append TEXT to BUFFER (optionally with FACE) and scroll it into view."
   (when buffer
     (with-current-buffer buffer
       (goto-char (point-max))
@@ -109,7 +111,7 @@
       (let ((win (get-buffer-window buffer t)))
         (when win (set-window-point win (point-max)))))))
 
-;;; 请求/响应
+;;; Request/response
 
 (defun node-repl--dispatch (server result)
   (let ((callback (pop (node-repl--queue server))))
@@ -117,9 +119,9 @@
       (funcall callback result))))
 
 (defun node-repl--console-args (args)
-  "把 console 消息的 ARGS 转成显示文本。
-字符串参数原样显示；数字/布尔（json.el 解析为 number/t/json-false，
-JSON null 为 nil）按字面显示。"
+  "Format ARGS of a console message for display.
+Strings are shown as-is; numbers/booleans (parsed by json.el as
+number/t/json-false, JSON null as nil) are shown literally."
   (mapconcat
    (lambda (a)
      (cond ((stringp a) a)
@@ -139,7 +141,8 @@ JSON null 为 nil）按字面显示。"
       (when (string-match-p "[^[:space:]]" line)
         (let* ((msg (condition-case nil
                         (json-read-from-string line)
-                      ;; 容错：非 JSON 行（如模块泄漏的原生输出）原样显示，不中断 filter
+                      ;; Tolerate non-JSON lines (e.g. raw output leaked by
+                      ;; modules): show as-is, keep the filter alive
                       (error nil))))
           (if (null msg)
               (node-repl--append (node-repl--buffer server)
@@ -154,30 +157,30 @@ JSON null 为 nil）按字面显示。"
                         (node-repl--console-args (alist-get 'args msg))))))))))))
 
 (defun node-repl--clear-buffer-caches (server)
-  "清除所有关联 buffer 对 SERVER 的关联缓存。
-server 停止或退出时调用：sentinel 只清当前 buffer 的 local 值，其他 buffer
-的 `node-repl--server' 会残留死实例（eglot--on-shutdown 遍历
-managed-buffers 清理同款）。"
-  (dolist (buffer (node-repl--buffers server))
+  "Clear the cached SERVER reference in all buffers associated with it.
+Called when SERVER stops or exits: the sentinel only clears the local
+value in the current buffer, leaving stale instances in other buffers
+(the eglot--on-shutdown walk over managed-buffers, adapted)."
+  (dolist (buffer (node-repl--managed-buffers server))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (when (eq node-repl--server server)
-          (setq node-repl--server nil)))))
-  (setf (node-repl--buffers server) nil))
+        (when (eq node-repl--cached-server server)
+          (setq node-repl--cached-server nil)))))
+  (setf (node-repl--managed-buffers server) nil))
 
 (defun node-repl--sentinel (server _event)
-  ;; 任意终态事件（finished/killed/hangup/exited 等）都清理：进程死亡即
-  ;; 不可用，索引、keybinding、queue、各 buffer 关联缓存全部失效
-  ;; （eglot--on-shutdown 同款）
+  ;; Clean up on any terminal event (finished/killed/hangup/exited...): a
+  ;; dead process is unusable, so the index, keybindings, queue and all
+  ;; buffer-local caches are invalidated (like eglot--on-shutdown)
   (node-repl--clear-buffer-caches server)
   (remhash (node-repl--project server) node-repl--servers-by-project)
   (while (node-repl--queue server)
     (let ((callback (pop (node-repl--queue server))))
       (when callback
-        (funcall callback "REPL 进程已退出"))))
+        (funcall callback "REPL process exited"))))
   (node-repl--maybe-restore-keybindings))
 
-;;; C-M-x 绑定（幂等：任一实例运行时绑定，全部停止后恢复）
+;;; C-M-x bindings (idempotent: installed while any instance runs, restored when all stop)
 
 (defun node-repl--ensure-keybindings ()
   (unless node-repl--bindings-active
@@ -199,9 +202,9 @@ managed-buffers 清理同款）。"
     (setq node-repl--saved-bindings nil
           node-repl--bindings-active nil)))
 
-;;; 实例生命周期
+;;; Instance lifecycle
 
-(defun node-repl--start-server (project)
+(defun node-repl--connect (project)
   (let* ((name (node-repl--project-name project))
          (buffer (get-buffer-create (format "*node-repl: %s*" name)))
          (server (node-repl--make-server :project project :buffer buffer)))
@@ -209,7 +212,8 @@ managed-buffers 清理同款）。"
       (let ((inhibit-read-only t))
         (erase-buffer))
       (setq default-directory project)
-      ;; 只读展示：不提供 buffer 内输入，进程输出不受 read-only 影响
+      ;; Read-only display: no input in the buffer; process output is
+      ;; unaffected by read-only
       (read-only-mode 1))
     (setf (node-repl--stderr server)
           (make-pipe-process
@@ -224,69 +228,72 @@ managed-buffers 清理同款）。"
            :buffer buffer
            :command (list (node-repl--node-path) node-repl-script-path)
            :coding '(utf-8-unix . utf-8-unix)
-           ;; 显式指定 pipe：batch 模式下默认不创建 stdin 管道，数据无法到达子进程
+           ;; Explicit pipe: batch mode creates no stdin pipe by default,
+           ;; so data would never reach the child
            :connection-type 'pipe
            :filter (lambda (_proc string) (node-repl--filter server string))
            :sentinel (lambda (proc event) (node-repl--sentinel server event))
            :stderr (node-repl--stderr server)
            :noquery t))
     (puthash project server node-repl--servers-by-project)
-    (setq node-repl--server server)
-    (cl-pushnew (current-buffer) (node-repl--buffers server))
+    (setq node-repl--cached-server server)
+    (cl-pushnew (current-buffer) (node-repl--managed-buffers server))
     (node-repl--ensure-keybindings)
-    (message "node-repl 已启动：%s" name)
+    (message "node-repl started: %s" name)
     server))
 
-(defun node-repl--stop-server (server)
+(defun node-repl--shutdown-server (server)
   (when (process-live-p (node-repl--process server))
-    ;; delete-process 同步触发 sentinel（清理幂等，此处兜底非活进程路径）
+    ;; delete-process triggers the sentinel synchronously (cleanup is
+    ;; idempotent; this is the fallback for the dead-process path)
     (delete-process (node-repl--process server)))
   (node-repl--clear-buffer-caches server)
   (remhash (node-repl--project server) node-repl--servers-by-project)
   (node-repl--maybe-restore-keybindings))
 
-;;; 公开 API
+;;; Public API
 
 (defun node-repl-current-server ()
-  "返回当前 buffer 关联的 REPL 实例，nil 表示未启动。
-命中后把当前 buffer 登记到实例的关联列表（eglot--managed-buffers 同款），
-实例停止/退出时按列表清除各 buffer 的关联缓存，避免残留死实例。"
-  (let ((server (or node-repl--server
+  "Return the REPL instance associated with the current buffer, nil if none.
+Registers the current buffer with the instance (like eglot--managed-buffers)
+so its cached reference is cleared when the instance stops or exits."
+  (let ((server (or node-repl--cached-server
                     (when-let* ((project (node-repl--project-root)))
                       (gethash project node-repl--servers-by-project)))))
     (when server
-      (setq node-repl--server server)
-      (cl-pushnew (current-buffer) (node-repl--buffers server)))
+      (setq node-repl--cached-server server)
+      (cl-pushnew (current-buffer) (node-repl--managed-buffers server)))
     server))
 
-(defun node-repl-start ()
-  "在当前 buffer 的项目手动启动 REPL。
-已运行时：交互式调用询问是否重启（类似 eglot），程序化调用返回现有实例。"
+(defun node-repl-ensure ()
+  "Ensure a REPL instance for the current project is running.
+If one is already running: interactively ask whether to restart (like
+eglot), programmatically return the existing instance."
   (interactive)
   (let* ((project (node-repl--project-root))
          (server (and project (gethash project node-repl--servers-by-project))))
     (unless project
-      (user-error "当前 buffer 不在项目中（找不到 package.json）"))
+      (user-error "Current buffer is not in a project (no package.json found)"))
     (if server
         (if (called-interactively-p 'any)
             (when (y-or-n-p
-                   (format "项目 %s 的 node-repl 已在运行，重启？"
+                   (format "node-repl for project %s is already running; restart? "
                            (node-repl--project-name project)))
-              (node-repl--stop-server server)
-              (node-repl-start))
+              (node-repl--shutdown-server server)
+              (node-repl-ensure))
           server)
-      (node-repl--start-server project))))
+      (node-repl--connect project))))
 
-(defun node-repl-stop ()
-  "停止当前项目的 REPL。"
+(defun node-repl-shutdown ()
+  "Shut down the REPL of the current project."
   (interactive)
   (let ((server (node-repl-current-server)))
     (if server
-        (node-repl--stop-server server)
-      (user-error "当前项目的 node-repl 未启动"))))
+        (node-repl--shutdown-server server)
+      (user-error "No node-repl instance is running for the current project"))))
 
 (defun node-repl--code ()
-  "取当前 JS/TS 文件的顶层节点文本；有活动选区时取选区文本。"
+  "Text of the top-level node at point in the current JS/TS file, or the active region if any."
   (if (region-active-p)
       (buffer-substring-no-properties (region-beginning) (region-end))
     (when-let* ((node (treesit-parent-until
@@ -298,15 +305,16 @@ managed-buffers 清理同款）。"
                                       (treesit-node-end node)))))
 
 (defun node-repl-eval (code)
-  "在当前项目的 REPL 中求值 CODE，代码与响应追加到该实例的 transcript buffer。
+  "Evaluate CODE in the REPL of the current project.
 
-交互式调用时 CODE 取当前 JS/TS 文件顶层节点或选区（见 `node-repl--code'）。"
+Interactively, CODE is the top-level node at point or the active region
+(see `node-repl--code')."
   (interactive (list (string-trim (node-repl--code))))
   (unless code
-    (user-error "没有可求值的代码：需在 JS/TS 文件顶层节点上或选中区域"))
+    (user-error "Nothing to evaluate: point is not on a top-level JS/TS node and no region is active"))
   (let ((server (node-repl-current-server)))
     (unless server
-      (user-error "当前项目的 node-repl 未启动，先执行 M-x node-repl-start"))
+      (user-error "No node-repl instance is running; run M-x node-repl-ensure"))
     (node-repl--append (node-repl--buffer server)
                        (format "> %s\n" (string-replace "\n" "\n> " code))
                        'comint-highlight-prompt)

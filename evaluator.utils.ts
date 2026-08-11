@@ -7,8 +7,10 @@ function isTopLevelDeclaration(state: any) {
   return state.ancestors[state.ancestors.length - 2] === state.body;
 }
 
-/** 节点子树（任意深度）是否含不兼容抽取的构造：return（可能返回对象改变构造
- *  结果）或 MetaProperty（new.target/import.meta，在方法内为语法错误）。 */
+/** Whether the subtree (any depth) contains constructs incompatible with
+ *  extraction: return (may change the construction result by returning an
+ *  object) or MetaProperty (new.target/import.meta, a syntax error inside a
+ *  method). */
 function containsUnsafeNode(node: any): boolean {
   if (node.type === "ReturnStatement" || node.type === "MetaProperty") return true;
   for (const key of Object.keys(node)) {
@@ -25,7 +27,7 @@ function containsUnsafeNode(node: any): boolean {
   return false;
 }
 
-/** 子树内第一个 super() 调用（super 属性访问不匹配）。 */
+/** The first super() call in the subtree (super property access doesn't match). */
 function findSuperCall(node: any): any | null {
   if (node.type === "CallExpression" && node.callee.type === "Super") return node;
   for (const key of Object.keys(node)) {
@@ -47,15 +49,18 @@ function findSuperCall(node: any): any | null {
 }
 
 /**
- * 顶层 class 构造逻辑抽取（在 sucrase 输出上运行，无 TS 语法）：
- * constructor 方法体与实例字段初始化合并进原型方法 __replInit，
- * constructor 只保留参数转发（派生类保留 super() 调用）。
- * 重定义 class 时 __replInit 随原型热更新（见 repl.ts patchClass），构造逻辑
- * 变更无需重启 REPL：新实例构造时经原型链动态分派到新版 __replInit，
- * 旧实例可调 f.__replInit(...) 重跑初始化。
+ * Extract top-level class constructor logic (runs on sucrase output, no TS
+ * syntax): the constructor body and instance field initializers are merged
+ * into a prototype method __replInit, the constructor only keeps parameter
+ * forwarding (derived classes keep their super() call).
+ * On class redefinition __replInit hot-updates with the prototype (see
+ * patchClass in repl.ts), so constructor changes need no REPL restart: new
+ * instances dispatch to the newest __replInit through the prototype chain,
+ * old instances can re-run initialization via f.__replInit(...).
  *
- * 降级（不抽取，保持原样）：类体已有同名 __replInit 方法（内部名被占用）、
- * constructor 体含 return/MetaProperty。
+ * Degraded (no extraction, kept as-is): the class body already has a method
+ * named __replInit (internal name taken), or the constructor body contains
+ * return/MetaProperty.
  */
 function extractConstructor(state: any, classNode: any): void {
   const elements = classNode.body.body as any[];
@@ -86,7 +91,7 @@ function extractConstructor(state: any, classNode: any): void {
     params = fn.params;
   }
 
-  // 先读取全部文本（后续 replace 会清空对应区域）
+  // Read all text first (subsequent replaces clear the corresponding regions)
   const bodyText = ctorBody ? state.slice(ctorBody.start, ctorBody.end) : "";
   const paramsText = params.length
     ? state.slice(params[0].start, params[params.length - 1].end)
@@ -100,27 +105,31 @@ function extractConstructor(state: any, classNode: any): void {
 
   const ctorArgs = paramsText || "...__replArgs";
   if (ctorBody) {
-    // 原 body 移除 super() 调用后作为 __replInit 体（super 调用留在委托构造）
+    // Original body minus the super() call becomes the __replInit body (the
+    // super call stays in the delegating constructor)
     const initBody = superCall
       ? bodyText.slice(0, superCall.start - ctorBody.start) +
         bodyText.slice(superCall.end - ctorBody.start)
       : bodyText;
-    // 委托显式引用本类 prototype：this.__replInit 会在子类实例上被子类同名
-    // 方法遮蔽（super() 场景父类初始化丢失）；类表达式内部名绑定新类自身，
-    // 旧类委托则始终引用被 patch 更新的旧原型
+    // The delegation references this class's prototype explicitly:
+    // this.__replInit would be shadowed on subclass instances by their own
+    // method (parent initialization lost in the super() case); the class
+    // expression's internal name binds the new class itself, while the old
+    // class's delegation always references the patched old prototype
     state.replace(
       ctorBody.start, ctorBody.end,
       `{ ${superText ? `${superText}; ` : ""}${classNode.id.name}.prototype.__replInit.call(this${paramsText ? ", " + paramsText : ""}) }`,
     );
-    // replace(from===to) 在目标字符前插入：body.end-1 是类体 `}`，
-    // 插在其前即类体末尾
+    // replace(from===to) inserts before the target char: body.end-1 is the
+    // class body `}`, inserting before it lands at the end of the body
     state.replace(
       classNode.body.end - 1, classNode.body.end - 1,
       ` __replInit(${ctorArgs}) { ${fieldTexts.join("")}${initBody.slice(1, -1)} }`,
     );
   } else {
     const superForward = classNode.superClass ? "super(...__replArgs); " : "";
-    // body.start+1 是 `{` 后第一个字符：在其前插入即类体开头
+    // body.start+1 is the char right after `{`: inserting before it lands at
+    // the start of the body
     state.replace(
       classNode.body.start + 1, classNode.body.start + 1,
       `constructor(...__replArgs) { ${superForward}${classNode.id.name}.prototype.__replInit.call(this, ...__replArgs) } `,
@@ -140,25 +149,32 @@ const noop = () => {};
 const visitorsWithoutAncestors: RecursiveVisitors<any> = {
   ClassDeclaration(node, state, c) {
     if (isTopLevelDeclaration(state)) {
-      // 先抽取构造逻辑，再改写为 __replPatchClass 调用：外层赋值接收 patch
-      // 结果（旧类），参数 1 是旧绑定，参数 2 是新类（先临时赋值到绑定，
-      // 副作用可接受）。同名 class 重复定义时热更新旧类的原型
-      // （方法/静态成员全量同步，含 __replInit），保持绑定不变，旧实例
-      // 立即生效且 instanceof 不破坏；首次定义时旧绑定为 undefined，
-      // patch 直接返回新类。
+      // Extract constructor logic first, then rewrite to a
+      // __replPatchClass call: the outer assignment receives the patch
+      // result (the old class), arg 1 is the old binding, arg 2 is the new
+      // class (assigned to the binding first; side effects acceptable).
+      // Redefining a class with the same name hot-updates the old class's
+      // prototype (full sync of methods/static members, __replInit
+      // included), keeping the binding unchanged: old instances take effect
+      // immediately and instanceof stays intact; on first definition the old
+      // binding is undefined and patch returns the new class.
       extractConstructor(state, node);
       state.prepend(
         node,
         `${node.id!.name}=__replPatchClass(${node.id!.name}, ${node.id!.name}=`,
       );
       state.hoistedDeclarationStatements.push(`var ${node.id!.name}; `);
-      // 改写为表达式赋值后补分号：转换器（如 sucrase）可能在同一行拼接后续
-      // 语句，无分号时 ASI 不生效（offending token 与前一 token 间需有换行），
-      // 导致 Unexpected identifier 类语法错误
+      // After rewriting to an expression assignment, append a semicolon:
+      // converters (like sucrase) may join the following statement on the
+      // same line, where ASI does not apply (the offending token needs a
+      // newline before the previous token), causing Unexpected identifier
+      // style syntax errors
       state.append(node, ');');
-      // 不遍历子节点：抽取已把 constructor 体文本移到 __replInit，继续遍历
-      // 会对已移动位置的节点二次改写（文本错乱）。顺带避免方法体 var 被
-      // VariableDeclaration 改写（改写会破坏 var 提升语义）
+      // Don't descend into children: extraction moved the constructor body
+      // text into __replInit, so further traversal would rewrite the moved
+      // nodes a second time (text corruption). It also avoids method-body
+      // var statements being rewritten by VariableDeclaration (which would
+      // break var hoisting semantics)
     } else {
       walk.base.ClassDeclaration!(node, state, c);
     }
@@ -241,8 +257,10 @@ for (const nodeType of Object.keys(walk.base)) {
 }
 
 export function processCode(code: string) {
-  // 前后加换行：代码以行注释结尾时（如 "// a = 1"），`//` 会注释到行尾并
-  // 吞掉包装的 `})()`，无换行则解析报 Unexpected token
+  // Leading/trailing newlines: with a trailing line comment (e.g.
+  // "// a = 1"), `//` would comment out the rest of the line and swallow the
+  // wrapping `})()`, and without a newline parsing fails with
+  // Unexpected token
   const wrapped = `(async () => {\n${code}\n})()`;
   const root = parse(wrapped, {
     ecmaVersion: "latest",
@@ -282,8 +300,10 @@ export function processCode(code: string) {
     if (node.type === 'EmptyStatement') continue;
     if (node.type === 'ExpressionStatement') {
       state.prepend(node.expression, '{ value: (');
-      // 前导换行：改写后的前一条语句（如 class/var 改写）与 return 同行时，
-      // ASI 不生效（offending token 与前一 token 间需有换行），会导致语法错误
+      // Leading newline: when the rewritten previous statement (e.g.
+      // class/var rewrites) shares a line with this return, ASI does not
+      // apply (the offending token needs a newline before the previous
+      // token), causing a syntax error
       state.prepend(node, '\nreturn ');
       state.append(node.expression, ') }');
     }

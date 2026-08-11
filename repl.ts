@@ -1,19 +1,20 @@
 /**
  * Evaluator stdio REPL
  *
- * 协议（JSONL，UTF-8）：
- *   请求：一行 JSON，形如 {"code": "<JS/TS 代码>", "cwd": "<项目根>"}
- *   响应：一行 JSON：
- *     {"type": "result",  "result": "<结果或错误文本>"}
- *     {"type": "console", "method": "log", "args": ["<字符串原样>", <数字/布尔原样>]}
+ * Protocol (JSONL, UTF-8):
+ *   Request: one JSON line, e.g. {"code": "<JS/TS code>", "cwd": "<project root>"}
+ *   Response: one JSON line:
+ *     {"type": "result",  "result": "<result or error text>"}
+ *     {"type": "console", "method": "log", "args": ["<string args as-is>", <number/boolean args as-is>]}
  *
- * 有 cwd 时向 context 注入 createRequire(cwd)，代码内可用 require() 加载
- * 该项目的 node_modules 依赖（仅 require，不提供 import）。
- * 代码先经 sucrase 擦除 TS 类型并把 import/export/import() 转为
- * require/module.exports（transforms: typescript, imports, jsx），
- * 顶层 await 保留原样（async IIFE 内合法）。
- * 每个请求串行执行，vm context 跨请求保留。
- * 运行：pnpm start（即 node repl.ts，Node >= 23.6 原生类型擦除）
+ * With cwd, createRequire(cwd) is injected into the context, so code can load
+ * that project's node_modules with require() (require only, no import).
+ * Code is transpiled by sucrase (transforms: typescript, imports, jsx) which
+ * strips TS types and rewrites import/export/import() to
+ * require/module.exports; top-level await is kept as-is (legal inside the
+ * async IIFE wrapper). Requests run serially, the vm context persists across
+ * requests.
+ * Run: pnpm start (i.e. node repl.ts, Node >= 23.6 native type stripping)
  */
 
 import { createContext, runInContext } from "node:vm";
@@ -28,9 +29,10 @@ import { CookieJar } from "tough-cookie";
 import * as cheerio from "cheerio";
 import { processCode } from "./evaluator.utils.ts";
 
-// console 输出作为 JSON 消息走 stdout，与响应统一协议
-// 同时替换全局 console：require 的模块（含异步回调）的 console 输出也走协议，
-// 否则原生 console 的纯文本输出会污染 JSONL 流
+// console output goes to stdout as JSON messages, unified with the response
+// protocol. The global console is also replaced: console output from required
+// modules (including async callbacks) goes through the protocol too,
+// otherwise native plain-text console output would corrupt the JSONL stream
 const jsonConsole = Object.fromEntries(
   Object.keys(console).map((type) => [
     type,
@@ -52,25 +54,31 @@ const jsonConsole = Object.fromEntries(
 globalThis.console = jsonConsole;
 
 /**
- * 顶层 class 重复定义时的热更新（配合 evaluator.utils.ts 的改写）：
- * 把旧类同步到新类的成员集合（全量替换语义）：新类已移除的实例方法/静态
- * 成员从旧类删除（调用时报 is not a function，暴露删除，不静默保留旧实现），
- * 新类的成员按描述符复制到旧类（含 getter/setter）。返回旧 class —— 绑定
- * 不变，旧实例的原型链与 instanceof 不破坏，旧实例立即生效；extends 变化
- * 时同步切换旧原型链。
+ * Hot-update on top-level class redefinition (paired with the rewrite in
+ * evaluator.utils.ts): sync the old class to the new class's member set
+ * (full-replacement semantics). Instance/static members removed from the new
+ * class are deleted from the old one (calling them reports "is not a
+ * function", exposing the removal instead of silently keeping the old
+ * implementation); new members are copied to the old class by descriptor
+ * (getters/setters included). Returns the old class -- the binding stays put,
+ * old instances keep their prototype chain and instanceof, and old instances
+ * pick up the changes immediately; on extends changes the old prototype chain
+ * switches to the new parent.
  *
- * 构造逻辑经 evaluator.utils.ts 抽取为原型方法 __replInit（每次重定义重新
- * 生成），constructor 只委托调用，因此 constructor/字段初始化变更同样热
- * 更新：新实例构造时动态分派到新版 __replInit，旧实例可调 f.__replInit(...)
- * 重跑初始化。降级场景（用户占用 __replInit 名、constructor 含 return/
- * new.target）不抽取，构造变更不热更新。
+ * Constructor logic is extracted into the prototype method __replInit (see
+ * evaluator.utils.ts), regenerated on every redefinition; the constructor
+ * only delegates to it, so constructor/field-init changes hot-update too:
+ * new instances dispatch dynamically to the newest __replInit, old instances
+ * can re-run initialization via f.__replInit(...). Degraded cases (the
+ * __replInit name is taken by the user, constructor contains return/
+ * new.target) are not extracted, constructor changes don't hot-update.
  */
 function patchClass(oldClass: unknown, newClass: unknown): unknown {
   if (typeof newClass !== "function") return newClass;
   if (typeof oldClass !== "function" || oldClass === newClass) return newClass;
   const hasOwn = (o: object, k: PropertyKey) =>
     Object.prototype.hasOwnProperty.call(o, k);
-  // 全量同步：删除新类已移除的旧成员
+  // Full sync: delete old members the new class removed
   for (const key of Reflect.ownKeys(oldClass.prototype)) {
     if (key === "constructor") continue;
     if (!hasOwn(newClass.prototype, key)) {
@@ -83,7 +91,7 @@ function patchClass(oldClass: unknown, newClass: unknown): unknown {
       delete (oldClass as unknown as Record<PropertyKey, unknown>)[key];
     }
   }
-  // 实例成员：复制到旧原型，旧实例立即可见
+  // Instance members: copy to the old prototype, visible to old instances now
   for (const key of Reflect.ownKeys(newClass.prototype)) {
     if (key === "constructor") continue;
     Object.defineProperty(
@@ -92,7 +100,7 @@ function patchClass(oldClass: unknown, newClass: unknown): unknown {
       Object.getOwnPropertyDescriptor(newClass.prototype, key)!,
     );
   }
-  // 静态成员
+  // Static members
   for (const key of Reflect.ownKeys(newClass)) {
     if (key === "length" || key === "name" || key === "prototype") continue;
     Object.defineProperty(
@@ -101,7 +109,8 @@ function patchClass(oldClass: unknown, newClass: unknown): unknown {
       Object.getOwnPropertyDescriptor(newClass, key)!,
     );
   }
-  // extends 变化：旧原型链切到新父类（子类旧实例经原型链看到新父类成员）
+  // extends changes: switch the old prototype chain to the new parent (old
+  // subclass instances see new parent members through the chain)
   const newParent = Object.getPrototypeOf(newClass.prototype);
   if (newParent !== Object.getPrototypeOf(oldClass.prototype)) {
     Object.setPrototypeOf(oldClass.prototype, newParent);
@@ -109,7 +118,7 @@ function patchClass(oldClass: unknown, newClass: unknown): unknown {
   return oldClass;
 }
 
-// 与 crawler 环境一致的基础上下文（不含 got/save/rateLimiter）
+// Base context consistent with the crawler environment (no got/save/rateLimiter)
 const context = createContext({
   URLSearchParams,
   URL,
@@ -121,28 +130,28 @@ const context = createContext({
   console: jsonConsole,
   __replPatchClass: patchClass,
   WebSocket,
-  // esbuild format: "cjs" 会把 export 转为 module.exports 赋值
+  // esbuild format: "cjs" turns export into module.exports assignments
   module: { exports: {} },
   exports: {},
 });
 
-// 当前注入的项目 require 基准（fileDir 变化时更新 context）
+// Current injected project require base (recreated when fileDir changes)
 let requireBase: string | undefined;
 
 /**
- * 擦除 TS 类型并把模块语法转为 CJS：
- * - import 语句 → require（含 default/命名/命名空间/副作用，引用同步重写）
- * - export → exports/module.exports 赋值
- * - 动态 import() → Promise.resolve().then(() => require(...))
- * - 顶层 await 保留原样（processCode 包装的 async IIFE 内合法）
+ * Strip TS types and rewrite module syntax to CJS:
+ * - import statements -> require (default/named/namespace/side-effect, references rewritten)
+ * - export -> exports/module.exports assignments
+ * - dynamic import() -> Promise.resolve().then(() => require(...))
+ * - top-level await kept as-is (legal inside the async IIFE from processCode)
  */
 function transformCode(code: string): string {
   let js = transform(code, {
     transforms: ["typescript", "imports", "jsx"],
   }).code;
-  // 去掉 sucrase 注入的模块前缀："use strict" 是字符串语句、__esModule 标记
-  // 是表达式语句，都会被 processCode 当作最后表达式返回；vm 非严格环境
-  // 无需它们
+  // Drop sucrase's injected module prefix: "use strict" is a string
+  // statement and the __esModule marker an expression statement, both would
+  // be returned as the last expression by processCode; the vm is not strict
   js = js.replace(/^"use strict";/, "");
   js = js.replace(
     /^Object\.defineProperty\(exports, "__esModule", \{value: true\}\);/, "",
@@ -155,17 +164,20 @@ function respond(result: string): void {
 }
 
 /**
- * 给相对路径的 require 补 .ts/.tsx 扩展名：node 的 createRequire 不像 tsx
- * 那样自动解析无扩展名的 .ts 相对路径，sucrase 转译的 require("./x") 需
- * 显式 require("./x.ts")。仅当对应 TS 文件存在时补；非相对路径、已有
- * 扩展名（.js/.json 等）保持原样。解析失败时原样返回。
+ * Append .ts/.tsx extensions to relative require paths: node's createRequire
+ * does not resolve extensionless .ts relative paths the way tsx does, so a
+ * transpiled require("./x") must become require("./x.ts"). Only when the
+ * corresponding TS file exists; non-relative paths and paths with an
+ * extension (.js/.json etc.) are left alone. Returns the input unchanged on
+ * parse failure.
  */
 function fixRequireExtensions(js: string, base: string): string {
   try {
     const ast = parse(js, {
       ecmaVersion: "latest",
-      // module 而非 script：sucrase 输出保留顶层 await（processCode 包装的
-      // async IIFE 内合法），script 模式解析会抛错导致扩展名补不上
+      // module rather than script: sucrase output keeps top-level await
+      // (legal inside the async IIFE from processCode), which script mode
+      // would reject and leave extensions unpatched
       sourceType: "module",
       allowImportExportEverywhere: true,
     });
@@ -202,9 +214,11 @@ function fixRequireExtensions(js: string, base: string): string {
   }
 }
 
-// vm 代码中的异步错误（未 await 的 promise 等）会逃出 evalCode 的 try/catch，
-// 不能因此杀死 REPL：记录到 stderr（显示在 transcript buffer），进程保持存活。
-// 注意：这些错误无法关联到具体请求，不能走 respond（会破坏请求-响应配对）。
+// Async errors in vm code (unawaited promises etc.) escape evalCode's
+// try/catch and must not kill the REPL: log to stderr (shown in the
+// transcript buffer) and keep the process alive. Note: these errors cannot
+// be tied to a specific request, so respond() must not be used (it would
+// break the request/response pairing).
 process.on("unhandledRejection", (reason: unknown) => {
   process.stderr.write(`unhandledRejection: ${inspect(reason, { depth: 2 })}\n`);
 });
@@ -213,18 +227,21 @@ process.on("uncaughtException", (err) => {
 });
 
 /**
- * 解析代码中的 import 声明，生成同名顶层绑定语句（跨请求可用）：
+ * Parse import declarations in CODE and generate top-level bindings with the
+ * same names (usable across requests):
  * - default: var x = (m => m && m.__esModule ? m.default : m)(require("pkg"))
- * - named/别名: var x = require("pkg").prop
+ * - named/aliased: var x = require("pkg").prop
  * - namespace: var x = require("pkg")
- * sucrase 只重写同一份代码内的引用，绑定让后续请求也能使用导入名。
- * 解析失败（如含 JSX）时返回空串，仅首次请求内可用。
+ * sucrase only rewrites references within the same chunk of code; the
+ * bindings let later requests use the imported names. Returns "" on parse
+ * failure (e.g. JSX), in which case the names work only within the first
+ * request.
  */
 function buildImportBindings(code: string): string {
   try {
     const ast = parse(code, {
       ecmaVersion: "latest",
-      // script + allowImportExportEverywhere：只解析语法，不做模块语义检查
+      // script + allowImportExportEverywhere: syntax only, no module semantics
       sourceType: "script",
       allowImportExportEverywhere: true,
     });
@@ -253,25 +270,27 @@ function buildImportBindings(code: string): string {
 }
 
 /**
- * 移除 export 语句：REPL 无模块消费者，export 不产生任何效果，
- * 且 sucrase 生成的 exports 赋值表达式会被 processCode 当作返回值。
- * - export const/class/function: 删除 "export " 前缀，保留声明
- * - export default/export {}/export *: 删除整条语句
- * 解析失败（如含 JSX）时原样返回（export 由 sucrase 转换兜底）。
+ * Remove export statements: the REPL has no module consumer, exports have no
+ * effect, and sucrase's exports assignments would be returned as the
+ * expression value by processCode.
+ * - export const/class/function: drop the "export " prefix, keep the declaration
+ * - export default/export {}/export *: drop the whole statement
+ * On parse failure (e.g. JSX) returns the input unchanged (sucrase's
+ * transform handles exports as a fallback).
  */
 function stripExports(code: string): string {
   try {
     const ast = parse(code, {
       ecmaVersion: "latest",
-      // script + allowImportExportEverywhere：跳过模块语义检查
-      //（如 "Export 'a' is not defined"），只解析语法
+      // script + allowImportExportEverywhere: skip module semantics checks
+      // (e.g. "Export 'a' is not defined"), syntax only
       sourceType: "script",
       allowImportExportEverywhere: true,
     });
     const nodes = ast.body.filter((n) => n.type.startsWith("Export"));
     if (nodes.length === 0) return code;
     let result = code;
-    // 从后往前处理，避免偏移错乱
+    // Process back to front to keep offsets valid
     for (const n of [...nodes].reverse()) {
       if (n.type === "ExportNamedDeclaration" && n.declaration) {
         result = result.slice(0, n.start) + result.slice(n.declaration.start);
@@ -292,23 +311,28 @@ function evalCode(req: {
 }): Promise<void> {
   return (async () => {
     try {
-      // require 基准用代码所在目录：相对 import/require 按文件解析，
-      // 依赖解析沿目录向上找 node_modules；回退 cwd
+      // require base is the code's own directory: relative import/require
+      // resolves against the file, dependency lookup walks up to
+      // node_modules; falls back to cwd
       const base = req.fileDir ?? req.cwd;
       if (base && base !== requireBase) {
-        // 用假文件名而非目录：避免 Node 把目录按 package.json main 解析
+        // Use a fake filename rather than the directory: avoids Node
+        // resolving the directory by its package.json main
         context.require = createRequire(`${base}/__repl__.js`);
         requireBase = base;
       }
       const code = stripExports(req.code);
       const bindings = buildImportBindings(code);
       let js = transformCode(code);
-      // node 的 createRequire 不解析无扩展名的 .ts 相对路径，补扩展名
+      // node's createRequire does not resolve extensionless .ts relative
+      // paths; patch extensions
       if (base) {
         js = fixRequireExtensions(js, base);
       }
-      // 绑定单独执行：var 声明落到 context 属性，与用户代码同 Script 的
-      // 词法声明（const/let 同名）不冲突；后续请求通过属性使用导入名
+      // Bindings run separately: var declarations land on context properties
+      // and don't clash with lexical declarations (const/let) of the same
+      // name in the user code's Script; later requests use the names via
+      // properties
       if (bindings) {
         await runInContext(
           processCode(base ? fixRequireExtensions(bindings, base) : bindings),
@@ -324,7 +348,7 @@ function evalCode(req: {
   })();
 }
 
-// 请求串行排队执行，共享 context
+// Requests run serially through a queue, sharing the context
 let queue: Promise<void> = Promise.resolve();
 
 process.stdin.setEncoding("utf8");
@@ -344,20 +368,20 @@ process.stdin.on("data", (chunk: string) => {
           fileDir?: unknown;
         };
         if (typeof req.code !== "string") {
-          respond("请求缺少 code 字段");
+          respond("missing code field");
           return;
         }
         if (req.cwd !== undefined && typeof req.cwd !== "string") {
-          respond("请求 cwd 字段必须是字符串");
+          respond("cwd field must be a string");
           return;
         }
         if (req.fileDir !== undefined && typeof req.fileDir !== "string") {
-          respond("请求 fileDir 字段必须是字符串");
+          respond("fileDir field must be a string");
           return;
         }
         return evalCode({ code: req.code, cwd: req.cwd, fileDir: req.fileDir });
       } catch (err) {
-        respond(`请求解析失败: ${err}`);
+        respond(`failed to parse request: ${err}`);
       }
     });
   }

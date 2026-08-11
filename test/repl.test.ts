@@ -1,5 +1,5 @@
-// 服务端协议测试：spawn 当前 node 直接运行 repl.ts，按 JSONL 协议请求/断言响应。
-// 运行：pnpm test:repl（node --test test/repl.test.ts）
+// Server protocol tests: spawn the current node running repl.ts, send JSONL requests, assert responses.
+// Run: pnpm test:repl (node --test test/repl.test.ts)
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -7,9 +7,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-// 用当前 node 直接跑 repl.ts（Node ≥ 23.6 默认类型擦除，无需 tsx）
+// Run repl.ts directly with the current node (Node >= 23.6 native type stripping, no tsx)
 const replScript = path.join(root, "repl.ts");
-const projRoot = root; // node-repl 自身作为测试项目（有 acorn 等依赖）
+const projRoot = root; // node-repl itself is the test project (has acorn etc. as dependencies)
 const otherProj = path.resolve(root, "..", "auto-bidding-v2");
 
 let child: ChildProcessWithoutNullStreams;
@@ -33,7 +33,7 @@ function start(): void {
   child.stderr.on("data", (d: string) => (stderrText += d));
 }
 
-/** 发送一行原始输入，等待下一个 result 消息（跳过 console 消息）。 */
+/** Send one raw input line and wait for the next result message (skipping console messages). */
 function expectResult(deadlineMs = 8000): Promise<string> {
   return new Promise((resolve, reject) => {
     const startIdx = messages.length;
@@ -67,7 +67,7 @@ before(start);
 after(() => child.kill());
 
 test("require is undefined without cwd", async () => {
-  // 必须最先执行：任何 cwd 注入之前
+  // Must run first: before any cwd is injected
   assert.equal(await request("typeof require"), "'undefined'");
 });
 
@@ -97,10 +97,10 @@ test("redefining class updates existing instances", async () => {
   await request(`class Counter { inc() { return 1 } }`, projRoot);
   await request(`const c = new Counter()`, projRoot);
   assert.equal(await request(`c.inc()`, projRoot), "1");
-  // 重定义后旧实例立即用新方法
+  // After redefinition old instances use the new method immediately
   await request(`class Counter { inc() { return 2 } }`, projRoot);
   assert.equal(await request(`c.inc()`, projRoot), "2");
-  // 绑定不变：instanceof 与原型链不破坏，新实例同样用新方法
+  // Binding unchanged: instanceof and prototype chain intact, new instances also use the new method
   assert.equal(await request(`c instanceof Counter`, projRoot), "true");
   assert.equal(await request(`new Counter().inc()`, projRoot), "2");
 });
@@ -108,7 +108,7 @@ test("redefining class updates existing instances", async () => {
 test("constructor changes hot-update without restart", async () => {
   await request(`class Foo { constructor(n) { this.n = n } double() { return this.n * 2 } }`, projRoot);
   assert.equal(await request(`new Foo(5).double()`, projRoot), "10");
-  // 改 constructor 逻辑：新实例立即生效，instanceof 不破坏
+  // Changed constructor logic: new instances take effect immediately, instanceof intact
   await request(`class Foo { constructor(n) { this.n = n + 1 } double() { return this.n * 2 } }`, projRoot);
   assert.equal(await request(`new Foo(5).double()`, projRoot), "12");
   assert.equal(await request(`new Foo(5) instanceof Foo`, projRoot), "true");
@@ -119,7 +119,7 @@ test("class field changes hot-update", async () => {
   assert.equal(await request(`new Bar().get()`, projRoot), "1");
   await request(`class Bar { n = 2; get() { return this.n } }`, projRoot);
   assert.equal(await request(`new Bar().get()`, projRoot), "2");
-  // 新增字段也生效
+  // Newly added fields also take effect
   await request(`class Bar { n = 2; m = 3; sum() { return this.n + this.m } }`, projRoot);
   assert.equal(await request(`new Bar().sum()`, projRoot), "5");
 });
@@ -128,7 +128,7 @@ test("removed methods are deleted to expose errors", async () => {
   await request(`class Baz { a() { return 1 } b() { return 2 } }`, projRoot);
   await request(`const z = new Baz()`, projRoot);
   await request(`class Baz { a() { return 1 } }`, projRoot);
-  // 删除的方法：调用报错而非静默执行旧实现
+  // Removed methods: calling them errors instead of silently running the old implementation
   assert.match(await request(`z.b()`, projRoot), /is not a function/);
   assert.equal(await request(`z.a()`, projRoot), "1");
 });
@@ -158,7 +158,7 @@ test("subclass without constructor forwards super args", async () => {
 test("constructor with return is left as-is", async () => {
   await request(`class R { constructor() { return { x: 1 } } }`, projRoot);
   assert.equal(await request(`new R().x`, projRoot), "1");
-  // 降级：不抽取，重定义保持原样（不破坏）
+  // Degraded: no extraction, redefinition kept as-is (no breakage)
   await request(`class R { constructor() { return { x: 2 } } }`, projRoot);
   assert.equal(await request(`new R().x`, projRoot), "1");
 });
@@ -167,7 +167,7 @@ test("old instances re-run extracted init", async () => {
   await request(`class O { constructor(n) { this.n = n } }`, projRoot);
   await request(`const o = new O(1)`, projRoot);
   await request(`class O { constructor(n) { this.n = n * 10 } }`, projRoot);
-  // 旧实例状态保留，可手动重跑抽取的初始化
+  // Old instance state is kept; the extracted init can be re-run manually
   assert.equal(await request(`o.n`, projRoot), "1");
   assert.equal(await request(`o.__replInit(5); o.n`, projRoot), "50");
 });
@@ -193,7 +193,7 @@ test("redefining parent class updates subclass instances", async () => {
   await request(`class Sub extends Base { extra() { return "e" } }`, projRoot);
   await request(`const sub = new Sub()`, projRoot);
   assert.equal(await request(`sub.greet()`, projRoot), "'base1'");
-  // 父类重定义后，子类旧实例经原型链看到新方法
+  // After parent redefinition, old subclass instances see the new method through the prototype chain
   await request(`class Base { greet() { return "base2" } }`, projRoot);
   assert.equal(await request(`sub.greet()`, projRoot), "'base2'");
   assert.equal(await request(`sub.extra()`, projRoot), "'e'");
@@ -217,7 +217,7 @@ test("state persists across requests", async () => {
 });
 
 test("import only evaluates to undefined", async () => {
-  // sucrase 的 "use strict" 前缀不应被当作结果返回
+  // sucrase's "use strict" prefix must not be returned as the result
   assert.equal(await request(`import { spawn } from "node:child_process"`, projRoot), "undefined");
 });
 
@@ -239,14 +239,14 @@ test("namespace import binding persists", async () => {
 
 test("import shadowing does not conflict", async () => {
   await request(`import { parse } from "acorn"`, projRoot);
-  // 用户显式声明同名 const：词法声明遮蔽全局绑定，不报重复声明
+  // User-declared same-name const: lexical declaration shadows the global binding, no duplicate-declaration error
   assert.equal(
     await request(`const parse = 42; parse`, projRoot),
     "42",
   );
-  // 词法声明跨请求保留（vm 全局词法环境），绑定被遮蔽
+  // Lexical declarations persist across requests (vm global lexical environment), binding shadowed
   assert.equal(await request(`typeof parse`, projRoot), "'number'");
-  // 其他导入绑定不受影响
+  // Other import bindings unaffected
   assert.equal(await request(`typeof spawn`, projRoot), "'function'");
 });
 
@@ -297,9 +297,9 @@ test("dynamic import", async () => {
 });
 
 test("export keyword is stripped, declaration kept", async () => {
-  // export const 移去关键字后只剩 const 声明，不求值
+  // export const: after dropping the keyword only the const declaration remains, not evaluated
   assert.equal(await request("export const c = 3;", projRoot), "undefined");
-  // 声明仍可用；后续表达式正常求值
+  // The declaration is still usable; later expressions evaluate normally
   assert.equal(await request("c", projRoot), "3");
   assert.equal(await request("export const x = 42; x", projRoot), "42");
 });
@@ -324,7 +324,7 @@ test("export class combined with other statements", async () => {
   assert.equal(
     await request(`export class C {}
 const c = 3;`, projRoot),
-    "undefined", // 最后语句是声明，不求值
+    "undefined", // last statement is a declaration, not evaluated
   );
   assert.equal(await request(`typeof C`, projRoot), "'function'");
 });
@@ -370,7 +370,7 @@ test("require missing dependency reports error", async () => {
 });
 
 test("relative import resolves against fileDir", async () => {
-  // fileDir 基准：相对路径按代码所在目录解析（含 .ts 扩展）
+  // fileDir base: relative paths resolve against the code's directory (incl. .ts extensions)
   assert.equal(
     await request(
       `import { VK } from "./constants"; VK`,
@@ -382,7 +382,7 @@ test("relative import resolves against fileDir", async () => {
 });
 
 test("relative import with top-level await", async () => {
-  // 顶层 await 与文件相对 import 同现：扩展名补齐需在 module 模式下解析
+  // Top-level await alongside relative imports: extension patching requires module-mode parsing
   assert.equal(
     await request(
       `import { VK } from "./constants"; await new Promise(r => setTimeout(r, 5)); VK`,
@@ -402,11 +402,11 @@ test("syntax error", async () => {
 });
 
 test("malformed json request", async () => {
-  assert.match(await sendRaw("not-json"), /^请求解析失败/);
+  assert.match(await sendRaw("not-json"), /^failed to parse request/);
 });
 
 test("missing code field", async () => {
-  assert.equal(await sendRaw('{"nope":1}'), "请求缺少 code 字段");
+  assert.equal(await sendRaw('{"nope":1}'), "missing code field");
 });
 
 test("module console output goes through json protocol", async () => {
@@ -417,7 +417,7 @@ test("module console output goes through json protocol", async () => {
     ),
     "'ok'",
   );
-  // 等异步回调输出到达（发送一个后续请求保证排队）
+  // Wait for the async callback output (send a follow-up request to force queuing)
   await request("await new Promise(r => setTimeout(r, 50)); 'x'", projRoot);
   const consoleArgs = messages
     .filter((m) => m.type === "console")
@@ -433,6 +433,6 @@ test("unhandled rejection does not kill process", async () => {
     "'first'",
   );
   assert.match(stderrText, /unhandledRejection/);
-  // 进程仍可用
+  // The process is still usable
   assert.equal(await request("1 + 1", projRoot), "2");
 });
