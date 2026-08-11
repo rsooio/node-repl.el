@@ -59,7 +59,8 @@
   stderr         ; stderr 转发 pipe process
   buffer         ; *node-repl: <包名>*
   output         ; stdout 未解析缓冲
-  queue)         ; 响应回调队列（FIFO）
+  queue          ; 响应回调队列（FIFO）
+  buffers)       ; 关联 buffer 列表（eglot--managed-buffers 同款），停止/退出时按列表清缓存
 
 ;;; 查找索引（仅用于按项目查找实例，无生命周期职责）
 
@@ -152,17 +153,29 @@ JSON null 为 nil）按字面显示。"
                 (format "%s\n"
                         (node-repl--console-args (alist-get 'args msg))))))))))))
 
+(defun node-repl--clear-buffer-caches (server)
+  "清除所有关联 buffer 对 SERVER 的关联缓存。
+server 停止或退出时调用：sentinel 只清当前 buffer 的 local 值，其他 buffer
+的 `node-repl--server' 会残留死实例（eglot--on-shutdown 遍历
+managed-buffers 清理同款）。"
+  (dolist (buffer (node-repl--buffers server))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when (eq node-repl--server server)
+          (setq node-repl--server nil)))))
+  (setf (node-repl--buffers server) nil))
+
 (defun node-repl--sentinel (server _event)
-  (when (string-match-p "\\`\\(finished\\|deleted\\)" _event)
-    ;; 实例自己从索引摘除（eglot--on-shutdown 同款）
-    (remhash (node-repl--project server) node-repl--servers-by-project)
-    (when (eq node-repl--server server)
-      (setq node-repl--server nil))
-    (while (node-repl--queue server)
-      (let ((callback (pop (node-repl--queue server))))
-        (when callback
-          (funcall callback "REPL 进程已退出"))))
-    (node-repl--maybe-restore-keybindings)))
+  ;; 任意终态事件（finished/killed/hangup/exited 等）都清理：进程死亡即
+  ;; 不可用，索引、keybinding、queue、各 buffer 关联缓存全部失效
+  ;; （eglot--on-shutdown 同款）
+  (node-repl--clear-buffer-caches server)
+  (remhash (node-repl--project server) node-repl--servers-by-project)
+  (while (node-repl--queue server)
+    (let ((callback (pop (node-repl--queue server))))
+      (when callback
+        (funcall callback "REPL 进程已退出"))))
+  (node-repl--maybe-restore-keybindings))
 
 ;;; C-M-x 绑定（幂等：任一实例运行时绑定，全部停止后恢复）
 
@@ -219,26 +232,32 @@ JSON null 为 nil）按字面显示。"
            :noquery t))
     (puthash project server node-repl--servers-by-project)
     (setq node-repl--server server)
+    (cl-pushnew (current-buffer) (node-repl--buffers server))
     (node-repl--ensure-keybindings)
     (message "node-repl 已启动：%s" name)
     server))
 
 (defun node-repl--stop-server (server)
   (when (process-live-p (node-repl--process server))
+    ;; delete-process 同步触发 sentinel（清理幂等，此处兜底非活进程路径）
     (delete-process (node-repl--process server)))
+  (node-repl--clear-buffer-caches server)
   (remhash (node-repl--project server) node-repl--servers-by-project)
-  (when (eq node-repl--server server)
-    (setq node-repl--server nil))
   (node-repl--maybe-restore-keybindings))
 
 ;;; 公开 API
 
 (defun node-repl-current-server ()
-  "返回当前 buffer 关联的 REPL 实例，nil 表示未启动。"
-  (or node-repl--server
-      (when-let* ((project (node-repl--project-root)))
-        (setq node-repl--server
-              (gethash project node-repl--servers-by-project)))))
+  "返回当前 buffer 关联的 REPL 实例，nil 表示未启动。
+命中后把当前 buffer 登记到实例的关联列表（eglot--managed-buffers 同款），
+实例停止/退出时按列表清除各 buffer 的关联缓存，避免残留死实例。"
+  (let ((server (or node-repl--server
+                    (when-let* ((project (node-repl--project-root)))
+                      (gethash project node-repl--servers-by-project)))))
+    (when server
+      (setq node-repl--server server)
+      (cl-pushnew (current-buffer) (node-repl--buffers server)))
+    server))
 
 (defun node-repl-start ()
   "在当前 buffer 的项目手动启动 REPL。
