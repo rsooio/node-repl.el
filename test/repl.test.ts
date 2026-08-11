@@ -381,6 +381,18 @@ test("relative import resolves against fileDir", async () => {
   );
 });
 
+test("relative import with top-level await", async () => {
+  // 顶层 await 与文件相对 import 同现：扩展名补齐需在 module 模式下解析
+  assert.equal(
+    await request(
+      `import { VK } from "./constants"; await new Promise(r => setTimeout(r, 5)); VK`,
+      projRoot,
+      path.join(root, "test", "fixtures"),
+    ),
+    "'vk-value'",
+  );
+});
+
 test("runtime error", async () => {
   assert.equal(await request("foo()", projRoot), "ReferenceError: foo is not defined");
 });

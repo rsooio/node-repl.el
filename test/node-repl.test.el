@@ -97,6 +97,21 @@
                               (server-buffer-text))
               "relative import via fileDir")))
 
+;; 4c. console 输出：数字/布尔参数按字面显示，不破坏 filter
+(with-temp-buffer
+  (setq default-directory node-repl-test-root)
+  (let* ((server node-repl-test-proj-a)
+         (buf (node-repl--buffer server)))
+    (node-repl-eval "console.log(0); console.log('a', 1, true, false); 1")
+    (wait-for (node-repl--process server)
+              (lambda () (string-match-p "a 1 true"
+                                         (with-current-buffer buf (buffer-string))))
+              5)
+    (assert-t (string-match-p
+               (regexp-quote "> console.log(0); console.log('a', 1, true, false); 1\n0\na 1 true false\n=> 1\n\n")
+               (with-current-buffer buf (buffer-string)))
+              "console args formatted")))
+
 ;; 5. 索引查找：新 buffer（同项目 A）无缓存也能找到实例
 (with-temp-buffer
   (setq default-directory node-repl-test-root)

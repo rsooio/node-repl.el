@@ -5,7 +5,7 @@
  *   请求：一行 JSON，形如 {"code": "<JS/TS 代码>", "cwd": "<项目根>"}
  *   响应：一行 JSON：
  *     {"type": "result",  "result": "<结果或错误文本>"}
- *     {"type": "console", "method": "log", "args": "<inspect 文本>"}
+ *     {"type": "console", "method": "log", "args": ["<字符串原样>", <数字/布尔原样>]}
  *
  * 有 cwd 时向 context 注入 createRequire(cwd)，代码内可用 require() 加载
  * 该项目的 node_modules 依赖（仅 require，不提供 import）。
@@ -120,6 +120,7 @@ const context = createContext({
   setTimeout,
   console: jsonConsole,
   __replPatchClass: patchClass,
+  WebSocket,
   // esbuild format: "cjs" 会把 export 转为 module.exports 赋值
   module: { exports: {} },
   exports: {},
@@ -163,7 +164,9 @@ function fixRequireExtensions(js: string, base: string): string {
   try {
     const ast = parse(js, {
       ecmaVersion: "latest",
-      sourceType: "script",
+      // module 而非 script：sucrase 输出保留顶层 await（processCode 包装的
+      // async IIFE 内合法），script 模式解析会抛错导致扩展名补不上
+      sourceType: "module",
       allowImportExportEverywhere: true,
     });
     const edits: { start: number; end: number; text: string }[] = [];

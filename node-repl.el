@@ -20,7 +20,7 @@
 ;;   请求：一行 JSON  {"code": "<JS/TS 代码>", "cwd": "<项目根>"}
 ;;   响应：一行 JSON：
 ;;     {"type": "result",  "result": "<结果或错误文本>"}
-;;     {"type": "console", "method": "log", "args": "<inspect 文本>"}
+;;     {"type": "console", "method": "log", "args": ["<字符串参数原样>", <数字/布尔参数原样>]}
 ;;
 ;; 服务端由 node 直接运行 repl.ts（Node >= 23.6 原生 TS 类型擦除），模块语法
 ;; 经 sucrase 转译后求值，并向 context 注入项目的 createRequire（代码内可用
@@ -115,6 +115,20 @@
     (when callback
       (funcall callback result))))
 
+(defun node-repl--console-args (args)
+  "把 console 消息的 ARGS 转成显示文本。
+字符串参数原样显示；数字/布尔（json.el 解析为 number/t/json-false，
+JSON null 为 nil）按字面显示。"
+  (mapconcat
+   (lambda (a)
+     (cond ((stringp a) a)
+           ((null a) "null")
+           ((eq a json-false) "false")
+           ((eq a t) "true")
+           ((numberp a) (number-to-string a))
+           (t (format "%S" a))))
+   args " "))
+
 (defun node-repl--filter (server string)
   (setf (node-repl--output server) (concat (node-repl--output server) string))
   (while (string-match "\n" (node-repl--output server))
@@ -135,7 +149,8 @@
               ("console"
                (node-repl--append
                 (node-repl--buffer server)
-                (format "%s\n" (string-join (alist-get 'args msg) " ")))))))))))
+                (format "%s\n"
+                        (node-repl--console-args (alist-get 'args msg))))))))))))
 
 (defun node-repl--sentinel (server _event)
   (when (string-match-p "\\`\\(finished\\|deleted\\)" _event)
