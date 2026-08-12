@@ -155,6 +155,24 @@ test("subclass without constructor forwards super args", async () => {
   assert.equal(await request(`new QSub(7).get()`, projRoot), "7");
 });
 
+test("constructor default parameters keep passed values", async () => {
+  // Regression: the default initializer must not be copied into the
+  // __replInit delegation call, where "loc = \"\"" would be an assignment
+  // resetting the argument on every construction
+  await request(`class W { constructor(bin: string, loc = "") { this.bin = bin; this.loc = loc } }`, projRoot);
+  assert.equal(await request(`new W("b").loc`, projRoot), "''");
+  assert.equal(await request(`new W("b", "x").loc`, projRoot), "'x'");
+  assert.equal(await request(`new W().loc`, projRoot), "''");
+});
+
+test("subclass super call passes values through default parameters", async () => {
+  // Regression: base constructor default parameter + subclass super call
+  // with computed arguments (data.hwnd || loc) must reach the base
+  await request(`class W { constructor(bin: string, loc = "") { this.bin = bin; this.loc = loc } }`, projRoot);
+  await request(`class H extends W { constructor(w: W, data: any, loc: string) { super(w["bin"], data.hwnd || loc); this.data = data } }`, projRoot);
+  assert.equal(await request(`new H(new W("b"), { hwnd: "0x460824" }, "/Window").loc`, projRoot), "'0x460824'");
+});
+
 test("constructor with return is left as-is", async () => {
   await request(`class R { constructor() { return { x: 1 } } }`, projRoot);
   assert.equal(await request(`new R().x`, projRoot), "1");

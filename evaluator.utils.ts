@@ -93,6 +93,18 @@ function extractConstructor(state: any, classNode: any): void {
 
   // Read all text first (subsequent replaces clear the corresponding regions)
   const bodyText = ctorBody ? state.slice(ctorBody.start, ctorBody.end) : "";
+  // Forward only the argument values, not the default initializers: copied
+  // into the call expression, "loc = \"\"" would be an assignment
+  // re-evaluated on every call, forcibly resetting the argument to its
+  // default and losing the passed value (defaults stay on the __replInit
+  // signature where they keep their meaning)
+  const callParams = params
+    .map((p) =>
+      p.type === "AssignmentPattern"
+        ? state.slice(p.left.start, p.left.end)
+        : state.slice(p.start, p.end),
+    )
+    .join(", ");
   const paramsText = params.length
     ? state.slice(params[0].start, params[params.length - 1].end)
     : "";
@@ -118,7 +130,7 @@ function extractConstructor(state: any, classNode: any): void {
     // class's delegation always references the patched old prototype
     state.replace(
       ctorBody.start, ctorBody.end,
-      `{ ${superText ? `${superText}; ` : ""}${classNode.id.name}.prototype.__replInit.call(this${paramsText ? ", " + paramsText : ""}) }`,
+      `{ ${superText ? `${superText}; ` : ""}${classNode.id.name}.prototype.__replInit.call(this${callParams ? ", " + callParams : ""}) }`,
     );
     // replace(from===to) inserts before the target char: body.end-1 is the
     // class body `}`, inserting before it lands at the end of the body
